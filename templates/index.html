@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NukeSandbox</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="bg-orb bg-orb-a"></div>
+  <div class="bg-orb bg-orb-b"></div>
+
+  <main class="shell">
+    <section class="hero">
+      <p class="eyebrow">AI-Native Disposable Sandbox</p>
+      <h1>NotionGuard</h1>
+      <p class="subtitle">Run a safe, disposable telemetry check and get a human-centered security report in seconds.</p>
+    </section>
+
+    <section class="panel">
+      <form id="analyze-form" class="analyze-form">
+        <label for="target-url">Target URL</label>
+        <div class="row">
+          <input id="target-url" name="target_url" type="url" placeholder="https://example.com" required />
+          <button id="analyze-btn" type="submit">Analyze</button>
+        </div>
+        <p id="status-text" class="status">Ready.</p>
+      </form>
+    </section>
+
+    <section id="result" class="result hidden">
+      <article class="card risk-card">
+        <h2>Risk Level</h2>
+        <p id="risk-level" class="risk-badge">-</p>
+        <p id="summary" class="summary"></p>
+      </article>
+
+      <article class="card">
+        <h2>Technical Findings</h2>
+        <ul id="findings" class="findings"></ul>
+      </article>
+
+      <article class="card">
+        <h2>Recommendation</h2>
+        <p id="recommendation"></p>
+      </article>
+
+      <article class="card">
+        <h2>Telemetry Excerpt</h2>
+        <pre id="telemetry"></pre>
+      </article>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
