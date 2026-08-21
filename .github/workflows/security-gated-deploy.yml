@@ -1,0 +1,82 @@
+name: Security-gated build and deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  sast-and-dependency-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: returntocorp/semgrep-action@v1
+        with:
+          config: p/default
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  build-and-image-scan:
+    needs: sast-and-dependency-scan
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: nukesandbox:${{ github.sha }}
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: nukesandbox:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+      - id: image
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        if: github.event_name != 'pull_request'
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }},ghcr.io/${{ github.repository }}:latest
+
+  deploy:
+    needs: build-and-image-scan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Configure cluster access
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_DATA }}
+        run: echo "$KUBECONFIG_DATA" | base64 --decode > "$RUNNER_TEMP/kubeconfig"
+      - name: Deploy only the security-scanned image
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          IMAGE: ${{ needs.build-and-image-scan.outputs.image }}
+        run: |
+          kubectl apply -k k8s
+          kubectl -n nukesandbox set image deployment/nukesandbox-api api="$IMAGE"
+          kubectl -n nukesandbox rollout status deployment/nukesandbox-api --timeout=120s

@@ -1,0 +1,4 @@
+resources:
+  - deployment.yaml
+  - network-policy.yaml
+  - external-secret.yaml

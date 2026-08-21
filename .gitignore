@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# OS
+.DS_Store
+
+# Security scan and IaC state artifacts
+.semgrep/
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
