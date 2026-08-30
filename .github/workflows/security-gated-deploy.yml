@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.image.outputs.image }}
+      digest: ${{ steps.publish.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -51,17 +52,31 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: "1"
           ignore-unfixed: true
-      - id: image
-        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@v6
+      - id: publish
+        uses: docker/build-push-action@v6
         if: github.event_name != 'pull_request'
         with:
           context: .
           push: true
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }},ghcr.io/${{ github.repository }}:latest
+      - id: image
+        if: github.event_name != 'pull_request'
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}@${{ steps.publish.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+  sign-image:
+    needs: build-and-image-scan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      packages: read
+    steps:
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the scanned immutable image with GitHub OIDC
+        run: cosign sign --yes "${{ needs.build-and-image-scan.outputs.image }}"
 
   deploy:
-    needs: build-and-image-scan
+    needs: [build-and-image-scan, sign-image]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: production

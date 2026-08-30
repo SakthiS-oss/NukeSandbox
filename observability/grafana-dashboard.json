@@ -1,0 +1,13 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {"type": "timeseries", "title": "Analysis outcomes", "targets": [{"expr": "sum(rate(nukesandbox_analysis_requests_total[5m])) by (outcome)", "legendFormat": "{{outcome}}"}]},
+    {"type": "timeseries", "title": "Sandbox duration (P95)", "targets": [{"expr": "histogram_quantile(0.95, sum(rate(nukesandbox_sandbox_duration_seconds_bucket[5m])) by (le))", "legendFormat": "P95"}]},
+    {"type": "stat", "title": "Sandbox cleanup errors (1h)", "targets": [{"expr": "sum(increase(nukesandbox_sandbox_teardowns_total{outcome=\"error\"}[1h]))"}]}
+  ],
+  "schemaVersion": 39,
+  "tags": ["nukesandbox", "security"],
+  "title": "NukeSandbox Operations",
+  "uid": "nukesandbox-operations"
+}

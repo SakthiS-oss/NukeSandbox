@@ -1,0 +1,58 @@
+# Apply only after Kyverno and Cosign verification are configured for the cluster.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-nukesandbox-workload-hardening
+  annotations:
+    policies.kyverno.io/title: Enforce NukeSandbox workload hardening
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: reject-hostpath-and-privileged-containers
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [nukesandbox]
+      validate:
+        message: HostPath volumes and privileged containers are prohibited.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.volumes[?hostPath] | length(@) }}"
+                operator: GreaterThan
+                value: 0
+              - key: "{{ request.object.spec.containers[?securityContext.privileged == `true`] | length(@) }}"
+                operator: GreaterThan
+                value: 0
+    - name: require-image-tag-and-resources
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [nukesandbox]
+      validate:
+        message: Containers require immutable non-latest images and CPU/memory limits.
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"
+                resources:
+                  limits:
+                    cpu: "?*"
+                    memory: "?*"
+    - name: verify-nukesandbox-image-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [nukesandbox]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/sakthis-oss/nukesandbox:*"
+          attestors:
+            - entries:
+                - keyless:
+                    subject: "https://github.com/SakthiS-oss/NukeSandbox/.github/workflows/security-gated-deploy.yml@refs/heads/main"
+                    issuer: "https://token.actions.githubusercontent.com"

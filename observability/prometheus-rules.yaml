@@ -1,0 +1,29 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: nukesandbox-alerts
+  namespace: nukesandbox
+spec:
+  groups:
+    - name: nukesandbox.sandbox
+      rules:
+        - alert: NukeSandboxHighFailureRate
+          expr: |
+            sum(rate(nukesandbox_analysis_requests_total{outcome!="success"}[5m]))
+            / clamp_min(sum(rate(nukesandbox_analysis_requests_total[5m])), 1) > 0.10
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: NukeSandbox analysis failures exceed 10%.
+        - alert: NukeSandboxSandboxP95Slow
+          expr: histogram_quantile(0.95, sum(rate(nukesandbox_sandbox_duration_seconds_bucket[10m])) by (le)) > 8
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: NukeSandbox P95 sandbox duration exceeds 8 seconds.
+        - alert: NukeSandboxCleanupFailed
+          expr: increase(nukesandbox_sandbox_teardowns_total{outcome="error"}[10m]) > 0
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: NukeSandbox failed to clean up one or more sandbox workloads.

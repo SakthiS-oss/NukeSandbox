@@ -1,0 +1,24 @@
+# Install Argo CD and Argo Rollouts first, then apply this Application from the Argo CD namespace.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nukesandbox
+  namespace: argocd
+  annotations:
+    argocd-image-updater.argoproj.io/image-list: api=ghcr.io/sakthis-oss/nukesandbox
+    argocd-image-updater.argoproj.io/api.update-strategy: digest
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/SakthiS-oss/NukeSandbox.git
+    targetRevision: main
+    path: k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: nukesandbox
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false

@@ -8,18 +8,19 @@ NukeSandbox is a security-focused URL triage service. It runs a target URL in a 
 - **Kubernetes-native execution:** in-cluster mode creates a disposable restricted Pod for every inspection; the API service has namespace-scoped RBAC only for creating, reading logs from, and deleting those Pods.
 - **Infrastructure as code:** Terraform provisions the namespace, restricted service account, Role/RoleBinding, and resource quota. It deliberately uses an existing cluster context so cloud credentials and cluster lifecycle remain separate from application state.
 - **Secrets management:** production configuration uses External Secrets Operator (ESO) to materialize `GOOGLE_API_KEY` from a `ClusterSecretStore`; no secret is included in Git, the image, or a Kubernetes manifest.
-- **Security gates:** the GitHub Actions workflow fails pull requests on Semgrep SAST or Trivy filesystem/image findings rated High or Critical. Only an image that passes those checks can reach the deploy job.
-- **Operability:** JSON logs are friendly to Loki/ELK-style collectors. Prometheus metrics expose request outcomes, sandbox duration, and cleanup outcomes at `/metrics`; Kubernetes probes use `/health` and `/ready`.
+- **Security gates:** the GitHub Actions workflow fails pull requests on Semgrep SAST or Trivy filesystem/image findings rated High or Critical, then signs release images with GitHub OIDC and Cosign.
+- **Operability:** request IDs and OpenTelemetry spans correlate API, sandbox, and Gemini work. JSON logs are friendly to Loki/ELK-style collectors; Prometheus metrics expose request outcomes, sandbox duration, and cleanup outcomes at `/metrics`.
+- **Abuse resistance:** URL DNS preflight blocks non-public addresses, and optional Redis-backed per-client quotas fail closed when the rate limiter is unavailable.
 
 ## Architecture
 
 ```text
 GitHub Actions ── Semgrep + Trivy ──> build/scan image ──> Kubernetes deployment
                                                         │
-Client ──> FastAPI ──(least-privilege RBAC)──> temporary curl Pod ──> telemetry
+Client ──> FastAPI ──(request ID + rate limit)──> temporary curl Pod ──> telemetry
               │                                             │
-              ├── JSON logs                                └── removed on completion
-              └── /metrics ──> Prometheus/Grafana
+              ├── JSON logs + OTEL traces                   └── removed on completion
+              └── /metrics ──> Prometheus/Grafana/alerts
 
 External Secrets Operator ──> Kubernetes Secret ──> GOOGLE_API_KEY
 ```
@@ -29,13 +30,14 @@ External Secrets Operator ──> Kubernetes Secret ──> GOOGLE_API_KEY
 Prerequisites: Python 3.10+, Node 18+, and Docker Desktop.
 
 ```bash
-python -m venv venv
+python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 
 cd frontend && npm ci && npm run build && cd ..
 cp .env.example .env  # then replace the placeholder local-development key
-python main.py
+python3 main.py
+pytest
 ```
 
 Local mode defaults to the Docker runner. It uses `curlimages/curl`, which contains curl, instead of assuming the base Alpine image includes it. Visit `http://localhost:8000`; health and metrics are at `/health` and `/metrics`.
@@ -52,13 +54,27 @@ Local mode defaults to the Docker runner. It uses `curlimages/curl`, which conta
    ```
 
 3. Install External Secrets Operator and configure a `ClusterSecretStore` named `vault-backend` (the supplied manifest assumes Vault; adapt the store and `remoteRef` values for AWS/GCP/Doppler).
-4. Build and publish an image, replace `ghcr.io/your-org/nukesandbox:latest` in `k8s/deployment.yaml`, then apply the workload:
+4. Build and publish an image, then deploy its immutable digest rather than a mutable tag:
 
    ```bash
    kubectl apply -k k8s
+   kubectl -n nukesandbox set image deployment/nukesandbox-api \
+     api=ghcr.io/sakthis-oss/nukesandbox@sha256:YOUR_SIGNED_DIGEST
    ```
 
 The workload uses `SANDBOX_EXECUTION_MODE=kubernetes`; it never mounts the host Docker socket. The network policy establishes a default ingress deny; add an ingress-controller policy appropriate to your environment. In production, additionally restrict egress at the CNI/firewall layer to DNS plus approved destinations—this matters because the product intentionally follows user-supplied URLs.
+
+## Production add-ons
+
+These components are intentionally separate from the base app because each requires its own cluster controller:
+
+- **Tracing:** set `OTEL_EXPORTER_OTLP_ENDPOINT` to an OpenTelemetry Collector. The sample collector configuration is in `observability/otel-collector-config.yaml` and exports to Tempo.
+- **Rate limiting:** set `RATE_LIMIT_ENABLED=true` and provide `REDIS_URL`; the API permits `RATE_LIMIT_REQUESTS` requests per `RATE_LIMIT_WINDOW_SECONDS` for each source IP. Use a managed, TLS-protected Redis service in production.
+- **Dashboards and alerts:** import `observability/grafana-dashboard.json` into Grafana and apply `observability/prometheus-rules.yaml` when Prometheus Operator is installed.
+- **Admission policy:** install Kyverno, validate `policies/kyverno-nukesandbox.yaml` in audit mode, then enforce it. It blocks hostPath/Docker socket mounts, privileged containers, `latest` images, missing limits, and unsigned NukeSandbox images.
+- **GitOps and canaries:** install Argo CD, Argo Rollouts, and Argo CD Image Updater, then apply `gitops/argocd-application.yaml`. `gitops/canary-rollout.yaml` is a staged 25% → 50% → 100% release example.
+
+See `docs/threat-model.md` for trust boundaries, attack paths, mitigations, and residual risk.
 
 ### Required GitHub repository settings
 

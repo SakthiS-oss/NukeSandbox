@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import contextvars
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -18,9 +22,19 @@ from docker.errors import NotFound as DockerNotFound
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, HttpUrl, ValidationError
 from prometheus_client import Counter, Histogram, make_asgi_app
+from redis import Redis
+from redis.exceptions import RedisError
+
+from opentelemetry import context as otel_context
+from opentelemetry import propagate, trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from google import genai
 from google.genai import errors as genai_errors
@@ -56,17 +70,36 @@ load_dotenv()  # Local-development fallback; Kubernetes injects this through a S
 app = FastAPI(title="NukeSandbox API", version="1.0.0")
 app.mount("/metrics", make_asgi_app())
 
+request_id_context: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+
+
+def _configure_tracing() -> None:
+    """Export traces only when an OTLP collector endpoint is configured."""
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if not endpoint:
+        return
+    provider = TracerProvider(resource=Resource.create({"service.name": "nukesandbox-api"}))
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint, insecure=True)))
+    trace.set_tracer_provider(provider)
+
+
+_configure_tracing()
+tracer = trace.get_tracer("nukesandbox")
+
 
 class JsonFormatter(logging.Formatter):
     """Emit machine-readable logs for collection by a container platform."""
 
     def format(self, record: logging.LogRecord) -> str:
+        span_context = trace.get_current_span().get_span_context()
         return json.dumps(
             {
                 "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%SZ"),
                 "level": record.levelname,
                 "logger": record.name,
                 "message": record.getMessage(),
+                "request_id": request_id_context.get(),
+                "trace_id": format(span_context.trace_id, "032x") if span_context.is_valid else None,
             }
         )
 
@@ -104,6 +137,59 @@ if FRONTEND_ASSETS.exists():
 MAX_TELEMETRY_CHARS = 12000
 DOCKER_TIMEOUT_SECONDS = 10
 KUBERNETES_NAMESPACE = os.getenv("SANDBOX_NAMESPACE", "nukesandbox")
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "false").lower() == "true"
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+_redis_client: Redis | None = None
+
+
+def _get_redis_client() -> Redis:
+    global _redis_client
+    if _redis_client is None:
+        redis_url = os.getenv("REDIS_URL")
+        if not redis_url:
+            raise RuntimeError("REDIS_URL must be configured when rate limiting is enabled.")
+        _redis_client = Redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=1)
+    return _redis_client
+
+
+def _enforce_rate_limit(client_ip: str) -> None:
+    """Use Redis as a shared fixed-window quota; fail closed to protect sandbox spend."""
+    key = f"nukesandbox:rate-limit:{client_ip}:{int(time.time() // RATE_LIMIT_WINDOW_SECONDS)}"
+    try:
+        requests = _get_redis_client().incr(key)
+        if requests == 1:
+            _get_redis_client().expire(key, RATE_LIMIT_WINDOW_SECONDS)
+    except (RedisError, RuntimeError) as exc:
+        logger.error("rate_limit_unavailable error=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Rate limiter is unavailable.") from exc
+    if requests > RATE_LIMIT_REQUESTS:
+        raise HTTPException(status_code=429, detail="Analysis quota exceeded; retry shortly.")
+
+
+@app.middleware("http")
+async def add_request_context_and_rate_limit(request, call_next):
+    """Correlate API work end-to-end and enforce a shared analysis quota."""
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request_token = request_id_context.set(request_id)
+    extracted_context = propagate.extract(request.headers)
+    context_token = otel_context.attach(extracted_context)
+    try:
+        with tracer.start_as_current_span(f"http.{request.method.lower()}") as span:
+            span.set_attribute("http.request.method", request.method)
+            span.set_attribute("url.path", request.url.path)
+            span.set_attribute("nukesandbox.request_id", request_id)
+            if RATE_LIMIT_ENABLED and request.url.path == "/api/analyze":
+                _enforce_rate_limit(request.client.host if request.client else "unknown")
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            span.set_attribute("http.response.status_code", response.status_code)
+            return response
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+    finally:
+        otel_context.detach(context_token)
+        request_id_context.reset(request_token)
 
 
 def _redact_url_in_text(text: str, target_url: str) -> str:
@@ -112,10 +198,34 @@ def _redact_url_in_text(text: str, target_url: str) -> str:
     return re.sub(escaped, "<TARGET_URL>", text, flags=re.IGNORECASE)
 
 
+def _validate_public_target(target_url: str) -> None:
+    """Block direct SSRF to non-public addresses before sandbox execution."""
+    hostname = urlparse(target_url).hostname
+    if not hostname:
+        raise HTTPException(status_code=400, detail="Target URL must include a hostname.")
+    try:
+        addresses = {result[4][0] for result in socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)}
+    except socket.gaierror as exc:
+        raise HTTPException(status_code=400, detail="Target hostname cannot be resolved.") from exc
+    for address in addresses:
+        if not ipaddress.ip_address(address).is_global:
+            raise HTTPException(status_code=400, detail="Target URL must resolve only to public IP addresses.")
+
+
 def _run_sandbox_telemetry(target_url: str) -> str:
-    container = None
     started_at = time.monotonic()
 
+    try:
+        with tracer.start_as_current_span("sandbox.docker") as span:
+            span.set_attribute("sandbox.runtime", "docker")
+            span.set_attribute("sandbox.timeout_seconds", DOCKER_TIMEOUT_SECONDS)
+            return _run_docker_sandbox(target_url)
+    finally:
+        SANDBOX_DURATION.observe(time.monotonic() - started_at)
+
+
+def _run_docker_sandbox(target_url: str) -> str:
+    container = None
     try:
         docker_client = docker.from_env()
         container = docker_client.containers.run(
@@ -168,7 +278,6 @@ def _run_sandbox_telemetry(target_url: str) -> str:
     except DockerException as exc:
         raise SandboxRuntimeError(f"Docker runtime failure: {exc}") from exc
     finally:
-        SANDBOX_DURATION.observe(time.monotonic() - started_at)
         if container is not None:
             try:
                 container.remove(force=True)
@@ -185,6 +294,16 @@ def _run_sandbox_telemetry(target_url: str) -> str:
 def _run_kubernetes_sandbox(target_url: str) -> str:
     """Run URL inspection as a tightly scoped, short-lived Kubernetes Pod."""
     started_at = time.monotonic()
+    try:
+        with tracer.start_as_current_span("sandbox.kubernetes") as span:
+            span.set_attribute("sandbox.runtime", "kubernetes")
+            span.set_attribute("k8s.namespace.name", KUBERNETES_NAMESPACE)
+            return _run_kubernetes_pod(target_url)
+    finally:
+        SANDBOX_DURATION.observe(time.monotonic() - started_at)
+
+
+def _run_kubernetes_pod(target_url: str) -> str:
     try:
         k8s_config.load_incluster_config()
         api = k8s_client.CoreV1Api()
@@ -226,7 +345,6 @@ def _run_kubernetes_sandbox(target_url: str) -> str:
     except KubernetesApiException as exc:
         raise SandboxRuntimeError(f"Kubernetes runtime failure: {exc.reason}") from exc
     finally:
-        SANDBOX_DURATION.observe(time.monotonic() - started_at)
         if "api" in locals() and "pod_name" in locals():
             try:
                 api.delete_namespaced_pod(pod_name, KUBERNETES_NAMESPACE, propagation_policy="Background")
@@ -241,6 +359,7 @@ def _generate_security_report(target_url: str, telemetry: str) -> SecurityReport
         raise RuntimeError("GOOGLE_API_KEY is not set.")
 
     client = genai.Client(api_key=api_key)
+    chosen_model = os.getenv("NUKESANDBOX_MODEL") or os.getenv("NOTIONGUARD_MODEL", "gemini-2.5-flash")
 
     scrubbed_telemetry = _redact_url_in_text(telemetry, target_url)
     prompt = (
@@ -257,22 +376,25 @@ def _generate_security_report(target_url: str, telemetry: str) -> SecurityReport
     )
 
     try:
-        chosen_model = os.getenv("NUKESANDBOX_MODEL") or os.getenv("NOTIONGUARD_MODEL", "gemini-2.5-flash")
-
-        response = client.models.generate_content(
-            model=chosen_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=SecurityReport,
-                temperature=0.2,
-            ),
-        )
+        with tracer.start_as_current_span("gemini.generate_report") as span:
+            span.set_attribute("gen_ai.request.model", chosen_model)
+            return _request_security_report(client, chosen_model, prompt)
     except genai_errors.APIError as exc:
         raise RuntimeError(f"GenAI API request failed: {exc}") from exc
     except Exception as exc:
         raise RuntimeError(f"Unexpected GenAI error: {exc}") from exc
 
+
+def _request_security_report(client: genai.Client, chosen_model: str, prompt: str) -> SecurityReport:
+    response = client.models.generate_content(
+        model=chosen_model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=SecurityReport,
+            temperature=0.2,
+        ),
+    )
     if response.parsed is not None:
         if isinstance(response.parsed, SecurityReport):
             return response.parsed
@@ -298,6 +420,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     parsed = urlparse(target_url)
     if parsed.scheme not in {"http", "https"}:
         raise HTTPException(status_code=400, detail="Only http and https URLs are supported.")
+    _validate_public_target(target_url)
 
     try:
         telemetry = (
@@ -359,4 +482,6 @@ def dashboard() -> HTMLResponse | FileResponse:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    # Pass the already-created application instance to avoid importing this module
+    # a second time, which would register Prometheus metrics twice.
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
