@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import socket
+import hashlib
+import json
 
 import pytest
 from fastapi import HTTPException
@@ -79,4 +81,42 @@ def test_rate_limit_rejects_excess_requests(monkeypatch: pytest.MonkeyPatch) -> 
     main._enforce_rate_limit("203.0.113.10")
     with pytest.raises(HTTPException) as exc_info:
         main._enforce_rate_limit("203.0.113.10")
+    assert exc_info.value.status_code == 429
+
+
+def test_api_key_authentication_returns_a_stable_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "API_AUTH_REQUIRED", True)
+    monkeypatch.setenv("API_KEY_HASHES", json.dumps({"portfolio-user": hashlib.sha256(b"test-key").hexdigest()}))
+
+    assert main._authenticate_api_key("test-key") == "portfolio-user"
+    with pytest.raises(HTTPException) as exc_info:
+        main._authenticate_api_key("incorrect")
+    assert exc_info.value.status_code == 401
+
+
+def test_proxy_is_required_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "REQUIRE_EGRESS_PROXY", True)
+    monkeypatch.setattr(main, "SANDBOX_EGRESS_PROXY", None)
+
+    with pytest.raises(main.SandboxRuntimeError, match="EGRESS_PROXY"):
+        main._sandbox_command("https://example.com")
+
+
+def test_proxy_command_forces_http_traffic_through_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "REQUIRE_EGRESS_PROXY", True)
+    monkeypatch.setattr(main, "SANDBOX_EGRESS_PROXY", "http://egress-proxy:3128")
+
+    command = main._sandbox_command("https://example.com")
+    assert ["--proxy", "http://egress-proxy:3128", "--noproxy", ""] == command[-5:-1]
+    assert "--proto-redir" in command
+
+
+def test_global_sandbox_capacity_rejects_when_limit_is_reached(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FullRedis:
+        def eval(self, *_args):
+            return 0
+
+    monkeypatch.setattr(main, "_redis_client", FullRedis())
+    with pytest.raises(HTTPException) as exc_info:
+        main._acquire_sandbox_slot()
     assert exc_info.value.status_code == 429

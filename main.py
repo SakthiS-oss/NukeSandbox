@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -71,6 +73,7 @@ app = FastAPI(title="NukeSandbox API", version="1.0.0")
 app.mount("/metrics", make_asgi_app())
 
 request_id_context: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+identity_context: contextvars.ContextVar[str] = contextvars.ContextVar("identity", default="anonymous")
 
 
 def _configure_tracing() -> None:
@@ -126,6 +129,10 @@ SANDBOX_TEARDOWNS = Counter(
     "Sandbox cleanup attempts by outcome.",
     ["outcome"],
 )
+AUTH_FAILURES = Counter("nukesandbox_auth_failures_total", "Rejected API authentication attempts.")
+SANDBOX_CAPACITY_REJECTIONS = Counter(
+    "nukesandbox_sandbox_capacity_rejections_total", "Requests rejected because the global sandbox cap was reached."
+)
 
 FRONTEND_DIST = Path("frontend/dist")
 FRONTEND_ASSETS = FRONTEND_DIST / "assets"
@@ -140,6 +147,12 @@ KUBERNETES_NAMESPACE = os.getenv("SANDBOX_NAMESPACE", "nukesandbox")
 RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "false").lower() == "true"
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+API_AUTH_REQUIRED = os.getenv("API_AUTH_REQUIRED", "false").lower() == "true"
+CONCURRENCY_LIMIT_ENABLED = os.getenv("CONCURRENCY_LIMIT_ENABLED", "false").lower() == "true"
+MAX_CONCURRENT_SANDBOXES = int(os.getenv("MAX_CONCURRENT_SANDBOXES", "5"))
+SANDBOX_SLOT_TTL_SECONDS = int(os.getenv("SANDBOX_SLOT_TTL_SECONDS", "30"))
+SANDBOX_EGRESS_PROXY = os.getenv("SANDBOX_EGRESS_PROXY")
+REQUIRE_EGRESS_PROXY = os.getenv("REQUIRE_EGRESS_PROXY", "false").lower() == "true"
 _redis_client: Redis | None = None
 
 
@@ -153,9 +166,28 @@ def _get_redis_client() -> Redis:
     return _redis_client
 
 
-def _enforce_rate_limit(client_ip: str) -> None:
+def _authenticate_api_key(provided_key: str | None) -> str:
+    """Authenticate an API key against SHA-256 digests stored in a runtime secret."""
+    if not API_AUTH_REQUIRED:
+        return "anonymous"
+    try:
+        key_hashes = json.loads(os.environ["API_KEY_HASHES"])
+    except (KeyError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=503, detail="API authentication is not configured.") from exc
+    if not isinstance(key_hashes, dict) or not provided_key:
+        AUTH_FAILURES.inc()
+        raise HTTPException(status_code=401, detail="A valid X-API-Key is required.")
+    supplied_digest = hashlib.sha256(provided_key.encode()).hexdigest()
+    for identity, expected_digest in key_hashes.items():
+        if isinstance(identity, str) and isinstance(expected_digest, str) and hmac.compare_digest(supplied_digest, expected_digest):
+            return identity
+    AUTH_FAILURES.inc()
+    raise HTTPException(status_code=401, detail="A valid X-API-Key is required.")
+
+
+def _enforce_rate_limit(identity: str) -> None:
     """Use Redis as a shared fixed-window quota; fail closed to protect sandbox spend."""
-    key = f"nukesandbox:rate-limit:{client_ip}:{int(time.time() // RATE_LIMIT_WINDOW_SECONDS)}"
+    key = f"nukesandbox:rate-limit:{identity}:{int(time.time() // RATE_LIMIT_WINDOW_SECONDS)}"
     try:
         requests = _get_redis_client().incr(key)
         if requests == 1:
@@ -167,11 +199,43 @@ def _enforce_rate_limit(client_ip: str) -> None:
         raise HTTPException(status_code=429, detail="Analysis quota exceeded; retry shortly.")
 
 
+def _acquire_sandbox_slot() -> None:
+    """Atomically reserve shared Redis capacity so sandboxes cannot exhaust the cluster."""
+    try:
+        acquired = _get_redis_client().eval(
+            "local active=tonumber(redis.call('GET', KEYS[1]) or '0'); "
+            "if active >= tonumber(ARGV[1]) then return 0 end; "
+            "redis.call('INCR', KEYS[1]); redis.call('EXPIRE', KEYS[1], ARGV[2]); return 1",
+            1,
+            "nukesandbox:active-sandboxes",
+            MAX_CONCURRENT_SANDBOXES,
+            SANDBOX_SLOT_TTL_SECONDS,
+        )
+    except (RedisError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail="Sandbox capacity controller is unavailable.") from exc
+    if not acquired:
+        SANDBOX_CAPACITY_REJECTIONS.inc()
+        raise HTTPException(status_code=429, detail="Sandbox capacity is currently exhausted; retry shortly.")
+
+
+def _release_sandbox_slot() -> None:
+    try:
+        _get_redis_client().eval(
+            "local active=tonumber(redis.call('GET', KEYS[1]) or '0'); "
+            "if active <= 1 then return redis.call('DEL', KEYS[1]) end; return redis.call('DECR', KEYS[1])",
+            1,
+            "nukesandbox:active-sandboxes",
+        )
+    except (RedisError, RuntimeError):
+        logger.error("sandbox_slot_release_failed")
+
+
 @app.middleware("http")
 async def add_request_context_and_rate_limit(request, call_next):
     """Correlate API work end-to-end and enforce a shared analysis quota."""
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request_token = request_id_context.set(request_id)
+    identity_token = None
     extracted_context = propagate.extract(request.headers)
     context_token = otel_context.attach(extracted_context)
     try:
@@ -179,8 +243,11 @@ async def add_request_context_and_rate_limit(request, call_next):
             span.set_attribute("http.request.method", request.method)
             span.set_attribute("url.path", request.url.path)
             span.set_attribute("nukesandbox.request_id", request_id)
-            if RATE_LIMIT_ENABLED and request.url.path == "/api/analyze":
-                _enforce_rate_limit(request.client.host if request.client else "unknown")
+            if request.url.path == "/api/analyze":
+                identity = _authenticate_api_key(request.headers.get("X-API-Key"))
+                identity_token = identity_context.set(identity)
+                if RATE_LIMIT_ENABLED:
+                    _enforce_rate_limit(identity if API_AUTH_REQUIRED else (request.client.host if request.client else "unknown"))
             response = await call_next(request)
             response.headers["X-Request-ID"] = request_id
             span.set_attribute("http.response.status_code", response.status_code)
@@ -189,6 +256,8 @@ async def add_request_context_and_rate_limit(request, call_next):
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
     finally:
         otel_context.detach(context_token)
+        if identity_token is not None:
+            identity_context.reset(identity_token)
         request_id_context.reset(request_token)
 
 
@@ -212,6 +281,19 @@ def _validate_public_target(target_url: str) -> None:
             raise HTTPException(status_code=400, detail="Target URL must resolve only to public IP addresses.")
 
 
+def _sandbox_command(target_url: str) -> list[str]:
+    """Build a redirect-limited curl invocation, optionally forcing all egress through a proxy."""
+    if REQUIRE_EGRESS_PROXY and not SANDBOX_EGRESS_PROXY:
+        raise SandboxRuntimeError("SANDBOX_EGRESS_PROXY is required in this environment.")
+    command = [
+        "curl", "-v", "-s", "-L", "--max-time", "8", "--max-redirs", "5",
+        "--proto", "=http,https", "--proto-redir", "=http,https",
+    ]
+    if SANDBOX_EGRESS_PROXY:
+        command.extend(["--proxy", SANDBOX_EGRESS_PROXY, "--noproxy", ""])
+    return [*command, target_url]
+
+
 def _run_sandbox_telemetry(target_url: str) -> str:
     started_at = time.monotonic()
 
@@ -230,7 +312,7 @@ def _run_docker_sandbox(target_url: str) -> str:
         docker_client = docker.from_env()
         container = docker_client.containers.run(
             image="curlimages/curl:8.11.1",
-            command=["curl", "-v", "-s", "-L", "--max-time", "8", target_url],
+            command=_sandbox_command(target_url),
             detach=True,
             network_mode="bridge",
             cap_drop=["ALL"],
@@ -310,7 +392,10 @@ def _run_kubernetes_pod(target_url: str) -> str:
         pod = api.create_namespaced_pod(
             namespace=KUBERNETES_NAMESPACE,
             body=k8s_client.V1Pod(
-                metadata=k8s_client.V1ObjectMeta(generate_name="url-sandbox-", labels={"app": "nukesandbox-sandbox"}),
+                metadata=k8s_client.V1ObjectMeta(
+                    generate_name="url-sandbox-",
+                    labels={"app.kubernetes.io/name": "nukesandbox-sandbox"},
+                ),
                 spec=k8s_client.V1PodSpec(
                     restart_policy="Never",
                     automount_service_account_token=False,
@@ -320,7 +405,7 @@ def _run_kubernetes_pod(target_url: str) -> str:
                         k8s_client.V1Container(
                             name="curl",
                             image="curlimages/curl:8.11.1",
-                            args=["-v", "-s", "-L", "--max-time", "8", target_url],
+                            args=_sandbox_command(target_url)[1:],
                             resources=k8s_client.V1ResourceRequirements(
                                 requests={"cpu": "50m", "memory": "64Mi"}, limits={"cpu": "250m", "memory": "128Mi"}
                             ),
@@ -422,36 +507,40 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         raise HTTPException(status_code=400, detail="Only http and https URLs are supported.")
     _validate_public_target(target_url)
 
+    slot_acquired = False
     try:
-        telemetry = (
-            _run_kubernetes_sandbox(target_url)
-            if os.getenv("SANDBOX_EXECUTION_MODE", "docker") == "kubernetes"
-            else _run_sandbox_telemetry(target_url)
-        )
-    except SandboxRuntimeError as exc:
-        ANALYSIS_REQUESTS.labels(outcome="sandbox_error").inc()
-        logger.warning("analysis_failed stage=sandbox")
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if CONCURRENCY_LIMIT_ENABLED:
+            _acquire_sandbox_slot()
+            slot_acquired = True
+        try:
+            telemetry = (
+                _run_kubernetes_sandbox(target_url)
+                if os.getenv("SANDBOX_EXECUTION_MODE", "docker") == "kubernetes"
+                else _run_sandbox_telemetry(target_url)
+            )
+        except SandboxRuntimeError as exc:
+            ANALYSIS_REQUESTS.labels(outcome="sandbox_error").inc()
+            logger.warning("analysis_failed stage=sandbox")
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    if not telemetry.strip():
-        ANALYSIS_REQUESTS.labels(outcome="empty_telemetry").inc()
-        logger.info("analysis_failed stage=telemetry")
-        raise HTTPException(status_code=422, detail="No telemetry captured from target URL.")
+        if not telemetry.strip():
+            ANALYSIS_REQUESTS.labels(outcome="empty_telemetry").inc()
+            logger.info("analysis_failed stage=telemetry")
+            raise HTTPException(status_code=422, detail="No telemetry captured from target URL.")
 
-    try:
-        report = _generate_security_report(target_url=target_url, telemetry=telemetry)
-    except RuntimeError as exc:
-        ANALYSIS_REQUESTS.labels(outcome="report_error").inc()
-        logger.warning("analysis_failed stage=report")
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        try:
+            report = _generate_security_report(target_url=target_url, telemetry=telemetry)
+        except RuntimeError as exc:
+            ANALYSIS_REQUESTS.labels(outcome="report_error").inc()
+            logger.warning("analysis_failed stage=report")
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    ANALYSIS_REQUESTS.labels(outcome="success").inc()
-    logger.info("analysis_completed risk_level=%s", report.risk_level)
-    return AnalyzeResponse(
-        target_url=target_url,
-        telemetry_excerpt=telemetry,
-        report=report,
-    )
+        ANALYSIS_REQUESTS.labels(outcome="success").inc()
+        logger.info("analysis_completed risk_level=%s", report.risk_level)
+        return AnalyzeResponse(target_url=target_url, telemetry_excerpt=telemetry, report=report)
+    finally:
+        if slot_acquired:
+            _release_sandbox_slot()
 
 
 @app.get("/health")

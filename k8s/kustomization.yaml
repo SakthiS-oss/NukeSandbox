@@ -1,4 +1,5 @@
 resources:
   - deployment.yaml
+  - egress-proxy.yaml
   - network-policy.yaml
   - external-secret.yaml

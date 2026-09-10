@@ -7,11 +7,24 @@ on:
   workflow_dispatch:
 
 permissions:
+  attestations: write
   contents: read
+  id-token: write
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+      - run: pytest -q --cov=main --cov-report=term-missing
+
   sast-and-dependency-scan:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,14 +88,44 @@ jobs:
       - name: Sign the scanned immutable image with GitHub OIDC
         run: cosign sign --yes "${{ needs.build-and-image-scan.outputs.image }}"
 
+  attest-and-publish-sbom:
+    needs: build-and-image-scan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: read
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate SPDX SBOM for the scanned image
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ needs.build-and-image-scan.outputs.image }}
+          format: spdx-json
+          artifact-name: nukesandbox-image-sbom
+          output-file: nukesandbox-image.spdx.json
+      - name: Attest image build provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ needs.build-and-image-scan.outputs.digest }}
+          push-to-registry: true
+
   deploy:
-    needs: [build-and-image-scan, sign-image]
+    needs: [build-and-image-scan, sign-image, attest-and-publish-sbom]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: production
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-kubectl@v4
+      - uses: sigstore/cosign-installer@v3
       - name: Configure cluster access
         env:
           KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_DATA }}
@@ -92,6 +135,10 @@ jobs:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
           IMAGE: ${{ needs.build-and-image-scan.outputs.image }}
         run: |
+          cosign verify \
+            --certificate-identity "https://github.com/SakthiS-oss/NukeSandbox/.github/workflows/security-gated-deploy.yml@refs/heads/main" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$IMAGE"
           kubectl apply -k k8s
           kubectl -n nukesandbox set image deployment/nukesandbox-api api="$IMAGE"
           kubectl -n nukesandbox rollout status deployment/nukesandbox-api --timeout=120s

@@ -8,9 +8,10 @@ NukeSandbox is a security-focused URL triage service. It runs a target URL in a 
 - **Kubernetes-native execution:** in-cluster mode creates a disposable restricted Pod for every inspection; the API service has namespace-scoped RBAC only for creating, reading logs from, and deleting those Pods.
 - **Infrastructure as code:** Terraform provisions the namespace, restricted service account, Role/RoleBinding, and resource quota. It deliberately uses an existing cluster context so cloud credentials and cluster lifecycle remain separate from application state.
 - **Secrets management:** production configuration uses External Secrets Operator (ESO) to materialize `GOOGLE_API_KEY` from a `ClusterSecretStore`; no secret is included in Git, the image, or a Kubernetes manifest.
-- **Security gates:** the GitHub Actions workflow fails pull requests on Semgrep SAST or Trivy filesystem/image findings rated High or Critical, then signs release images with GitHub OIDC and Cosign.
+- **Security gates:** GitHub Actions runs endpoint/security tests, Semgrep, and Trivy before publishing; release images receive an SPDX SBOM, build provenance attestation, and GitHub OIDC/Cosign signature that CD verifies before deployment.
 - **Operability:** request IDs and OpenTelemetry spans correlate API, sandbox, and Gemini work. JSON logs are friendly to Loki/ELK-style collectors; Prometheus metrics expose request outcomes, sandbox duration, and cleanup outcomes at `/metrics`.
 - **Abuse resistance:** URL DNS preflight blocks non-public addresses, and optional Redis-backed per-client quotas fail closed when the rate limiter is unavailable.
+- **Outbound containment:** production sandbox Pods are egress-isolated to a Squid proxy, which reevaluates redirect destinations and blocks non-public ranges.
 
 ## Architecture
 
@@ -95,3 +96,17 @@ Add `KUBECONFIG_DATA` as a protected environment secret, containing base64-encod
 ```
 
 `GET /health` checks process liveness, `GET /ready` confirms required runtime configuration is present, and `GET /metrics` exposes Prometheus-format metrics.
+
+## Public deployment controls
+
+Before exposing `/api/analyze`, enable `API_AUTH_REQUIRED`, store SHA-256 API-key digests in `API_KEY_HASHES`, and enable both Redis rate and concurrency limits. Generate a digest without writing the raw key to a shell history file:
+
+```bash
+read -rs API_KEY; echo
+printf %s "$API_KEY" | sha256sum
+unset API_KEY
+```
+
+Set the resulting value in the External Secret `nukesandbox/api-key-hashes`, for example `{"portfolio-user":"<sha256-digest>"}`. The API accepts the raw key only in the `X-API-Key` request header and uses the mapped identity for quota enforcement.
+
+Kubernetes mode sets `REQUIRE_EGRESS_PROXY=true`: sandbox Pods may reach only cluster DNS and `nukesandbox-egress-proxy`. The proxy denies non-public destination ranges on every connection, including redirected requests. The image tag in `k8s/egress-proxy.yaml` should be replaced with a tested digest before a production rollout.

@@ -41,6 +41,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: SANDBOX_EGRESS_PROXY
+              value: http://nukesandbox-egress-proxy:3128
+            - name: REQUIRE_EGRESS_PROXY
+              value: "true"
+            - name: API_AUTH_REQUIRED
+              value: "true"
+            - name: RATE_LIMIT_ENABLED
+              value: "true"
+            - name: CONCURRENCY_LIMIT_ENABLED
+              value: "true"
           envFrom:
             - secretRef:
                 name: nukesandbox-runtime

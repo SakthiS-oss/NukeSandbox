@@ -1,0 +1,75 @@
+# The proxy re-resolves each CONNECT/redirect destination and blocks non-public ranges.
+# Pin this image to a digest after testing it in your registry.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nukesandbox-egress-proxy-config
+  namespace: nukesandbox
+data:
+  squid.conf: |
+    http_port 3128
+    acl SSL_ports port 443
+    acl Safe_ports port 80 443
+    acl CONNECT method CONNECT
+    acl blocked_destination dst 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4
+    acl blocked_destination dst ::1/128 fc00::/7 fe80::/10 ff00::/8
+    http_access deny !Safe_ports
+    http_access deny CONNECT !SSL_ports
+    http_access deny blocked_destination
+    http_access allow all
+    cache deny all
+    access_log stdio:/dev/stdout
+    cache_log /dev/stderr
+    pid_filename /tmp/squid.pid
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nukesandbox-egress-proxy
+  namespace: nukesandbox
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nukesandbox-egress-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nukesandbox-egress-proxy
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: squid
+          image: ubuntu/squid:6.6-24.04_edge
+          args: ["-N", "-f", "/etc/squid/squid.conf"]
+          ports:
+            - name: proxy
+              containerPort: 3128
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/squid/squid.conf
+              subPath: squid.conf
+            - name: runtime
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: nukesandbox-egress-proxy-config
+        - name: runtime
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nukesandbox-egress-proxy
+  namespace: nukesandbox
+spec:
+  selector:
+    app.kubernetes.io/name: nukesandbox-egress-proxy
+  ports:
+    - name: proxy
+      port: 3128
+      targetPort: proxy
