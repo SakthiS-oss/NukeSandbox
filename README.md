@@ -41,7 +41,7 @@ python3 main.py
 pytest
 ```
 
-Local mode defaults to the Docker runner. It uses `curlimages/curl`, which contains curl, instead of assuming the base Alpine image includes it. Visit `http://localhost:8000`; health and metrics are at `/health` and `/metrics`.
+Local mode defaults to the Docker runner. It uses a digest-pinned `curlimages/curl` image, which contains curl, instead of assuming the base Alpine image includes it. Visit `http://localhost:8000`; health and metrics are at `/health` and `/metrics`. When `API_AUTH_REQUIRED=true`, enter the raw API key in the dashboard field so the UI can send `X-API-Key`.
 
 ## Kubernetes deployment
 
@@ -107,6 +107,6 @@ printf %s "$API_KEY" | sha256sum
 unset API_KEY
 ```
 
-Set the resulting value in the External Secret `nukesandbox/api-key-hashes`, for example `{"portfolio-user":"<sha256-digest>"}`. The API accepts the raw key only in the `X-API-Key` request header and uses the mapped identity for quota enforcement.
+Set the resulting value in the External Secret `nukesandbox/api-key-hashes`, for example `{"portfolio-user":"<sha256-digest>"}`. The API accepts the raw key only in the `X-API-Key` request header and uses the mapped identity for quota enforcement. The dashboard has a matching API-key field; the key stays in `sessionStorage` for the browser tab and is never written to the analysis prompt sent to Gemini.
 
-Kubernetes mode sets `REQUIRE_EGRESS_PROXY=true`: sandbox Pods may reach only cluster DNS and `nukesandbox-egress-proxy`. The proxy denies non-public destination ranges on every connection, including redirected requests. The image tag in `k8s/egress-proxy.yaml` should be replaced with a tested digest before a production rollout.
+Kubernetes mode sets `REQUIRE_EGRESS_PROXY=true`: sandbox Pods may reach only cluster DNS and `nukesandbox-egress-proxy`. The proxy denies non-public destination ranges on every connection, including redirected requests. The Squid image in `k8s/egress-proxy.yaml` is pinned to a multi-arch digest. CI publishes the API image as `:${{ github.sha }}` only (never `:latest`) and deploys the Cosign-verified digest.

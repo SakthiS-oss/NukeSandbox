@@ -20,8 +20,40 @@ type AnalyzeResponse = {
   report: SecurityReport;
 };
 
+const API_KEY_STORAGE = "nukesandbox.api-key";
+
+function readStoredApiKey(): string {
+  try {
+    return sessionStorage.getItem(API_KEY_STORAGE) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function rememberApiKey(value: string): void {
+  try {
+    sessionStorage.setItem(API_KEY_STORAGE, value);
+  } catch {
+    // Private-mode or blocked storage should not break analysis.
+  }
+}
+
+function formatApiError(detail: unknown, fallback: string): string {
+  if (typeof detail === "string" && detail.trim()) {
+    return detail;
+  }
+  if (Array.isArray(detail) && detail.length > 0) {
+    const first = detail[0] as { msg?: string };
+    if (typeof first?.msg === "string") {
+      return first.msg;
+    }
+  }
+  return fallback;
+}
+
 export function App(): JSX.Element {
   const [url, setUrl] = useState("");
+  const [apiKey, setApiKey] = useState(readStoredApiKey);
   const [status, setStatus] = useState("Ready to run analysis.");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -39,15 +71,20 @@ export function App(): JSX.Element {
     setStatus("Launching sandbox and collecting telemetry...");
 
     try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (apiKey.trim()) {
+        headers["X-API-Key"] = apiKey.trim();
+      }
+
       const response = await fetch("/api/analyze", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ target_url: url.trim() }),
       });
 
-      const payload = (await response.json()) as AnalyzeResponse | { detail?: string };
+      const payload = (await response.json()) as AnalyzeResponse | { detail?: unknown };
       if (!response.ok) {
-        throw new Error((payload as { detail?: string }).detail ?? "Analysis failed.");
+        throw new Error(formatApiError((payload as { detail?: unknown }).detail, "Analysis failed."));
       }
 
       setData(payload as AnalyzeResponse);
@@ -94,6 +131,20 @@ export function App(): JSX.Element {
                 {loading ? "Analyzing..." : "Analyze"}
               </Button>
             </div>
+            <label className="text-sm text-muted" htmlFor="api-key">
+              API key
+            </label>
+            <Input
+              id="api-key"
+              type="password"
+              autoComplete="off"
+              placeholder="Required when the server enforces X-API-Key"
+              value={apiKey}
+              onChange={(event) => {
+                setApiKey(event.target.value);
+                rememberApiKey(event.target.value);
+              }}
+            />
             <p className="text-sm text-muted">{status}</p>
             {error ? <p className="text-sm text-rose-300">{error}</p> : null}
           </form>
