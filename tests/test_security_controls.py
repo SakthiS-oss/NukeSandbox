@@ -61,6 +61,7 @@ def test_docker_runner_keeps_malicious_url_as_one_argument(monkeypatch: pytest.M
     assert main._run_docker_sandbox(malicious_url) == "telemetry"
     assert captured["command"][-1] == malicious_url
     assert captured["command"][:6] == ["curl", "-v", "-s", "-L", "--max-time", "8"]
+    assert captured["image"] == main.SANDBOX_IMAGE
     assert captured["cap_drop"] == ["ALL"]
     assert captured["read_only"] is True
 
@@ -120,3 +121,36 @@ def test_global_sandbox_capacity_rejects_when_limit_is_reached(monkeypatch: pyte
     with pytest.raises(HTTPException) as exc_info:
         main._acquire_sandbox_slot()
     assert exc_info.value.status_code == 429
+
+
+def test_gemini_prompt_never_includes_target_url_or_hostname() -> None:
+    target_url = "https://secret-target.example/path?token=abc"
+    telemetry = f"* Connected to secret-target.example\n> GET {target_url} HTTP/1.1\n< Location: {target_url}/next"
+
+    prompt = main._build_security_report_prompt(target_url, telemetry)
+
+    assert target_url not in prompt
+    assert "secret-target.example" not in prompt
+    assert "token=abc" not in prompt
+    assert "<TARGET_URL>" in prompt
+    assert "<TARGET_HOST>" in prompt
+
+
+def test_kubernetes_sandbox_matches_docker_hardening() -> None:
+    pod = main._kubernetes_sandbox_pod("https://example.com")
+    spec = pod.spec
+    container = spec.containers[0]
+
+    assert spec.automount_service_account_token is False
+    assert spec.enable_service_links is False
+    assert spec.security_context.run_as_non_root is True
+    assert spec.security_context.run_as_user == 65532
+    assert spec.security_context.seccomp_profile.type == "RuntimeDefault"
+    assert container.image == main.SANDBOX_IMAGE
+    assert "@sha256:" in container.image
+    assert container.security_context.allow_privilege_escalation is False
+    assert container.security_context.read_only_root_filesystem is True
+    assert container.security_context.privileged is False
+    assert container.security_context.capabilities.drop == ["ALL"]
+    assert container.security_context.seccomp_profile.type == "RuntimeDefault"
+    assert container.args[-1] == "https://example.com"

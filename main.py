@@ -143,6 +143,10 @@ if FRONTEND_ASSETS.exists():
 
 MAX_TELEMETRY_CHARS = 12000
 DOCKER_TIMEOUT_SECONDS = 10
+# Manifest-list digest so Docker and Kubernetes pull the same immutable curl image.
+SANDBOX_IMAGE = (
+    "curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69"
+)
 KUBERNETES_NAMESPACE = os.getenv("SANDBOX_NAMESPACE", "nukesandbox")
 RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "false").lower() == "true"
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
@@ -262,9 +266,31 @@ async def add_request_context_and_rate_limit(request, call_next):
 
 
 def _redact_url_in_text(text: str, target_url: str) -> str:
-    """Reduce prompt leakage by replacing repeated target URL mentions."""
+    """Replace the submitted URL so Gemini never sees the original destination."""
     escaped = re.escape(target_url)
-    return re.sub(escaped, "<TARGET_URL>", text, flags=re.IGNORECASE)
+    redacted = re.sub(escaped, "<TARGET_URL>", text, flags=re.IGNORECASE)
+    hostname = urlparse(target_url).hostname
+    if hostname:
+        redacted = re.sub(re.escape(hostname), "<TARGET_HOST>", redacted, flags=re.IGNORECASE)
+    return redacted
+
+
+def _build_security_report_prompt(target_url: str, telemetry: str) -> str:
+    """Build a Gemini prompt that contains only redacted telemetry, never the raw URL."""
+    return (
+        "You are NukeSandbox, an empathetic security analyst for non-expert users. "
+        "Analyze the HTTP/network telemetry below and produce a concise risk report.\n\n"
+        "Rules:\n"
+        "- Use plain language for summary and recommendation.\n"
+        "- Highlight concrete indicators only (status codes, TLS hints, redirects, headers, failures).\n"
+        "- If signals are mixed, choose MEDIUM.\n"
+        "- Never include markdown.\n"
+        "- Refer to the inspected destination as <TARGET_URL> or <TARGET_HOST> only. "
+        "Never echo, reconstruct, or guess the original URL.\n\n"
+        "Target: <TARGET_URL>\n"
+        "Telemetry:\n"
+        f"{_redact_url_in_text(telemetry, target_url)}"
+    )
 
 
 def _validate_public_target(target_url: str) -> None:
@@ -311,7 +337,7 @@ def _run_docker_sandbox(target_url: str) -> str:
     try:
         docker_client = docker.from_env()
         container = docker_client.containers.run(
-            image="curlimages/curl:8.11.1",
+            image=SANDBOX_IMAGE,
             command=_sandbox_command(target_url),
             detach=True,
             network_mode="bridge",
@@ -385,39 +411,57 @@ def _run_kubernetes_sandbox(target_url: str) -> str:
         SANDBOX_DURATION.observe(time.monotonic() - started_at)
 
 
+def _kubernetes_sandbox_pod(target_url: str) -> k8s_client.V1Pod:
+    """Disposable Pod with the same least-privilege controls as the Docker runner."""
+    return k8s_client.V1Pod(
+        metadata=k8s_client.V1ObjectMeta(
+            generate_name="url-sandbox-",
+            labels={"app.kubernetes.io/name": "nukesandbox-sandbox"},
+        ),
+        spec=k8s_client.V1PodSpec(
+            restart_policy="Never",
+            automount_service_account_token=False,
+            enable_service_links=False,
+            active_deadline_seconds=DOCKER_TIMEOUT_SECONDS,
+            security_context=k8s_client.V1PodSecurityContext(
+                run_as_non_root=True,
+                run_as_user=65532,
+                run_as_group=65532,
+                seccomp_profile=k8s_client.V1SeccompProfile(type="RuntimeDefault"),
+            ),
+            containers=[
+                k8s_client.V1Container(
+                    name="curl",
+                    image=SANDBOX_IMAGE,
+                    image_pull_policy="IfNotPresent",
+                    args=_sandbox_command(target_url)[1:],
+                    resources=k8s_client.V1ResourceRequirements(
+                        requests={"cpu": "50m", "memory": "64Mi"},
+                        limits={"cpu": "250m", "memory": "128Mi"},
+                    ),
+                    security_context=k8s_client.V1SecurityContext(
+                        allow_privilege_escalation=False,
+                        read_only_root_filesystem=True,
+                        privileged=False,
+                        run_as_non_root=True,
+                        run_as_user=65532,
+                        run_as_group=65532,
+                        capabilities=k8s_client.V1Capabilities(drop=["ALL"]),
+                        seccomp_profile=k8s_client.V1SeccompProfile(type="RuntimeDefault"),
+                    ),
+                )
+            ],
+        ),
+    )
+
+
 def _run_kubernetes_pod(target_url: str) -> str:
     try:
         k8s_config.load_incluster_config()
         api = k8s_client.CoreV1Api()
         pod = api.create_namespaced_pod(
             namespace=KUBERNETES_NAMESPACE,
-            body=k8s_client.V1Pod(
-                metadata=k8s_client.V1ObjectMeta(
-                    generate_name="url-sandbox-",
-                    labels={"app.kubernetes.io/name": "nukesandbox-sandbox"},
-                ),
-                spec=k8s_client.V1PodSpec(
-                    restart_policy="Never",
-                    automount_service_account_token=False,
-                    active_deadline_seconds=DOCKER_TIMEOUT_SECONDS,
-                    security_context=k8s_client.V1PodSecurityContext(run_as_non_root=True, run_as_user=65532),
-                    containers=[
-                        k8s_client.V1Container(
-                            name="curl",
-                            image="curlimages/curl:8.11.1",
-                            args=_sandbox_command(target_url)[1:],
-                            resources=k8s_client.V1ResourceRequirements(
-                                requests={"cpu": "50m", "memory": "64Mi"}, limits={"cpu": "250m", "memory": "128Mi"}
-                            ),
-                            security_context=k8s_client.V1SecurityContext(
-                                allow_privilege_escalation=False,
-                                read_only_root_filesystem=True,
-                                capabilities=k8s_client.V1Capabilities(drop=["ALL"]),
-                            ),
-                        )
-                    ],
-                ),
-            ),
+            body=_kubernetes_sandbox_pod(target_url),
         )
         pod_name = pod.metadata.name
         deadline = time.monotonic() + DOCKER_TIMEOUT_SECONDS + 2
@@ -444,21 +488,8 @@ def _generate_security_report(target_url: str, telemetry: str) -> SecurityReport
         raise RuntimeError("GOOGLE_API_KEY is not set.")
 
     client = genai.Client(api_key=api_key)
-    chosen_model = os.getenv("NUKESANDBOX_MODEL") or os.getenv("NOTIONGUARD_MODEL", "gemini-2.5-flash")
-
-    scrubbed_telemetry = _redact_url_in_text(telemetry, target_url)
-    prompt = (
-        "You are NukeSandbox, an empathetic security analyst for non-expert users. "
-        "Analyze the HTTP/network telemetry below and produce a concise risk report.\n\n"
-        "Rules:\n"
-        "- Use plain language for summary and recommendation.\n"
-        "- Highlight concrete indicators only (status codes, TLS hints, redirects, headers, failures).\n"
-        "- If signals are mixed, choose MEDIUM.\n"
-        "- Never include markdown.\n\n"
-        f"Target URL: {target_url}\n"
-        "Telemetry:\n"
-        f"{scrubbed_telemetry}"
-    )
+    chosen_model = os.getenv("NUKESANDBOX_MODEL", "gemini-2.5-flash")
+    prompt = _build_security_report_prompt(target_url, telemetry)
 
     try:
         with tracer.start_as_current_span("gemini.generate_report") as span:

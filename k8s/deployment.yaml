@@ -28,7 +28,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: api
-          # CI replaces this with a signed digest before the rollout.
+          # CI verifies Cosign and replaces this tag with a signed digest before rollout.
+          # Never ship :latest; Kyverno rejects mutable tags.
           image: ghcr.io/sakthis-oss/nukesandbox:main
           imagePullPolicy: IfNotPresent
           ports:
