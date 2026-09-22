@@ -1,0 +1,103 @@
+name: Azure security-gated build and deploy
+
+on:
+  pull_request:
+    branches: [Azure]
+  push:
+    branches: [Azure]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+      - run: pytest -q --cov=main --cov-report=term-missing
+
+  sast-and-dependency-scan:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: returntocorp/semgrep-action@v1
+        with:
+          config: p/default
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  build-and-image-scan:
+    needs: sast-and-dependency-scan
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: nukesandbox:${{ github.sha }}
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: nukesandbox:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+      - uses: azure/login@v2
+        if: github.event_name != 'pull_request'
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Publish the scanned image to Azure Container Registry
+        if: github.event_name != 'pull_request'
+        env:
+          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+        run: |
+          az acr login --name "${ACR_LOGIN_SERVER%%.*}"
+          docker tag "nukesandbox:${{ github.sha }}" "$ACR_LOGIN_SERVER/nukesandbox:${{ github.sha }}"
+          docker push "$ACR_LOGIN_SERVER/nukesandbox:${{ github.sha }}"
+      - id: digest
+        if: github.event_name != 'pull_request'
+        env:
+          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+        run: |
+          digest="$(az acr repository show --name "${ACR_LOGIN_SERVER%%.*}" --image "nukesandbox:${{ github.sha }}" --query digest -o tsv)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: [build-and-image-scan]
+    if: github.ref == 'refs/heads/Azure' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy only the scanned ACR digest
+        env:
+          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+          RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          DIGEST: ${{ needs.build-and-image-scan.outputs.digest }}
+        run: |
+          image="$ACR_LOGIN_SERVER/nukesandbox@$DIGEST"
+          az containerapp update \
+            --name nukesandbox-api \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$image"

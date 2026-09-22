@@ -12,6 +12,8 @@ import socket
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -157,7 +159,9 @@ MAX_CONCURRENT_SANDBOXES = int(os.getenv("MAX_CONCURRENT_SANDBOXES", "5"))
 SANDBOX_SLOT_TTL_SECONDS = int(os.getenv("SANDBOX_SLOT_TTL_SECONDS", "30"))
 SANDBOX_EGRESS_PROXY = os.getenv("SANDBOX_EGRESS_PROXY")
 REQUIRE_EGRESS_PROXY = os.getenv("REQUIRE_EGRESS_PROXY", "false").lower() == "true"
+AZURE_ARM_API_VERSION = "2024-03-01"
 _redis_client: Redis | None = None
+_azure_credential = None
 
 
 def _get_redis_client() -> Redis:
@@ -482,6 +486,188 @@ def _run_kubernetes_pod(target_url: str) -> str:
                 SANDBOX_TEARDOWNS.labels(outcome="error").inc()
 
 
+def _sandbox_execution_mode() -> str:
+    return os.getenv("SANDBOX_EXECUTION_MODE", "docker").lower()
+
+
+def _run_selected_sandbox(target_url: str) -> str:
+    mode = _sandbox_execution_mode()
+    if mode == "kubernetes":
+        return _run_kubernetes_sandbox(target_url)
+    if mode == "azure":
+        return _run_azure_sandbox(target_url)
+    return _run_sandbox_telemetry(target_url)
+
+
+def _azure_job_start_body(target_url: str) -> dict[str, object]:
+    """Build a Container Apps Job execution override. The URL stays a single argv element."""
+    command = _sandbox_command(target_url)
+    return {
+        "containers": [
+            {
+                "name": "curl",
+                "image": SANDBOX_IMAGE,
+                "command": ["curl"],
+                "args": command[1:],
+                "resources": {"cpu": 0.25, "memory": "0.5Gi"},
+            }
+        ]
+    }
+
+
+def _get_azure_credential():
+    global _azure_credential
+    if _azure_credential is None:
+        from azure.identity import DefaultAzureCredential
+
+        _azure_credential = DefaultAzureCredential()
+    return _azure_credential
+
+
+def _azure_settings() -> tuple[str, str, str]:
+    subscription = os.getenv("AZURE_SUBSCRIPTION_ID")
+    resource_group = os.getenv("AZURE_RESOURCE_GROUP")
+    job_name = os.getenv("AZURE_SANDBOX_JOB_NAME", "nukesandbox-sandbox")
+    if not subscription or not resource_group:
+        raise SandboxRuntimeError("Azure sandbox mode requires AZURE_SUBSCRIPTION_ID and AZURE_RESOURCE_GROUP.")
+    return subscription, resource_group, job_name
+
+
+def _azure_arm_request(method: str, path: str, payload: dict[str, object] | None = None) -> tuple[int, dict[str, str], dict]:
+    token = _get_azure_credential().get_token("https://management.azure.com/.default")
+    separator = "&" if "?" in path else "?"
+    url = f"https://management.azure.com{path}{separator}api-version={AZURE_ARM_API_VERSION}"
+    body = None if payload is None else json.dumps(payload).encode()
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {token.token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read()
+            parsed = json.loads(raw) if raw else {}
+            return response.status, dict(response.headers), parsed
+    except urllib.error.HTTPError as exc:
+        exc.read()
+        logger.warning("azure_arm_request_failed method=%s status=%s", method, exc.code)
+        raise SandboxRuntimeError(f"Azure ARM {method} failed: {exc.code}") from exc
+
+
+def _azure_execution_name(headers: dict[str, str], body: dict) -> str:
+    if isinstance(body.get("name"), str) and body["name"]:
+        return body["name"]
+    location = headers.get("Location") or headers.get("location") or str(body.get("id") or "")
+    if "/executions/" in location:
+        return location.rstrip("/").split("/executions/")[-1].split("?")[0]
+    raise SandboxRuntimeError("Azure job start did not return an execution name.")
+
+
+def _azure_event_stream_endpoint() -> str | None:
+    environment_id = os.getenv("AZURE_CONTAINER_APP_ENVIRONMENT_ID")
+    if not environment_id:
+        return None
+    _status, _headers, body = _azure_arm_request("GET", environment_id)
+    endpoint = body.get("properties", {}).get("eventStreamEndpoint")
+    return endpoint if isinstance(endpoint, str) and endpoint else None
+
+
+def _azure_first_replica(execution_name: str) -> str:
+    subscription, resource_group, job_name = _azure_settings()
+    path = (
+        f"/subscriptions/{subscription}/resourceGroups/{resource_group}"
+        f"/providers/Microsoft.App/jobs/{job_name}/executions/{execution_name}/replicas"
+    )
+    try:
+        _status, _headers, body = _azure_arm_request("GET", path)
+    except SandboxRuntimeError:
+        return execution_name
+    values = body.get("value")
+    if isinstance(values, list) and values and isinstance(values[0], dict):
+        name = values[0].get("name")
+        if isinstance(name, str) and name:
+            return name
+    return execution_name
+
+
+def _azure_fetch_logs(execution_name: str) -> str:
+    endpoint = _azure_event_stream_endpoint()
+    if not endpoint:
+        return ""
+    subscription, resource_group, job_name = _azure_settings()
+    replica = _azure_first_replica(execution_name)
+    token = _get_azure_credential().get_token("https://management.azure.com/.default")
+    url = (
+        f"{endpoint.rstrip('/')}/subscriptions/{subscription}/resourceGroups/{resource_group}"
+        f"/providers/Microsoft.App/jobs/{job_name}/executions/{execution_name}"
+        f"/replicas/{replica}/containers/curl/logstream?follow=false&tailLines=400"
+    )
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token.token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return response.read().decode("utf-8", errors="replace")[:MAX_TELEMETRY_CHARS]
+    except urllib.error.URLError:
+        logger.warning("azure_log_stream_failed")
+        return ""
+
+
+def _azure_stop_execution(execution_name: str) -> None:
+    subscription, resource_group, job_name = _azure_settings()
+    path = (
+        f"/subscriptions/{subscription}/resourceGroups/{resource_group}"
+        f"/providers/Microsoft.App/jobs/{job_name}/executions/{execution_name}/stop"
+    )
+    try:
+        _azure_arm_request("POST", path)
+        SANDBOX_TEARDOWNS.labels(outcome="removed").inc()
+    except SandboxRuntimeError:
+        SANDBOX_TEARDOWNS.labels(outcome="error").inc()
+
+
+def _run_azure_sandbox(target_url: str) -> str:
+    """Run URL inspection as a short-lived Azure Container Apps Job."""
+    started_at = time.monotonic()
+    execution_name: str | None = None
+    timed_out = False
+    try:
+        with tracer.start_as_current_span("sandbox.azure") as span:
+            span.set_attribute("sandbox.runtime", "azure")
+            subscription, resource_group, job_name = _azure_settings()
+            span.set_attribute("azure.resource_group", resource_group)
+            path = (
+                f"/subscriptions/{subscription}/resourceGroups/{resource_group}"
+                f"/providers/Microsoft.App/jobs/{job_name}/start"
+            )
+            _status, headers, body = _azure_arm_request("POST", path, _azure_job_start_body(target_url))
+            execution_name = _azure_execution_name(headers, body)
+            span.set_attribute("azure.job.execution", execution_name)
+
+            deadline = time.monotonic() + DOCKER_TIMEOUT_SECONDS + 8
+            status_path = (
+                f"/subscriptions/{subscription}/resourceGroups/{resource_group}"
+                f"/providers/Microsoft.App/jobs/{job_name}/executions/{execution_name}"
+            )
+            while time.monotonic() < deadline:
+                _status, _headers, execution = _azure_arm_request("GET", status_path)
+                phase = str(execution.get("properties", {}).get("status") or "")
+                if phase in {"Succeeded", "Failed", "Stopped"}:
+                    logs = _azure_fetch_logs(execution_name)
+                    if not logs.strip() and phase != "Succeeded":
+                        raise SandboxRuntimeError(f"Azure sandbox ended with status {phase} and no logs.")
+                    return logs
+                time.sleep(1)
+            timed_out = True
+            raise SandboxRuntimeError("Azure sandbox execution exceeded its deadline.")
+    finally:
+        SANDBOX_DURATION.observe(time.monotonic() - started_at)
+        if timed_out and execution_name is not None:
+            _azure_stop_execution(execution_name)
+
+
 def _generate_security_report(target_url: str, telemetry: str) -> SecurityReport:
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
@@ -544,11 +730,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             _acquire_sandbox_slot()
             slot_acquired = True
         try:
-            telemetry = (
-                _run_kubernetes_sandbox(target_url)
-                if os.getenv("SANDBOX_EXECUTION_MODE", "docker") == "kubernetes"
-                else _run_sandbox_telemetry(target_url)
-            )
+            telemetry = _run_selected_sandbox(target_url)
         except SandboxRuntimeError as exc:
             ANALYSIS_REQUESTS.labels(outcome="sandbox_error").inc()
             logger.warning("analysis_failed stage=sandbox")
@@ -584,6 +766,10 @@ def readiness() -> dict[str, str]:
     """Kubernetes readiness probe; no secret values are exposed."""
     if not os.getenv("GOOGLE_API_KEY"):
         raise HTTPException(status_code=503, detail="GOOGLE_API_KEY is not configured.")
+    if _sandbox_execution_mode() == "azure" and (
+        not os.getenv("AZURE_SUBSCRIPTION_ID") or not os.getenv("AZURE_RESOURCE_GROUP")
+    ):
+        raise HTTPException(status_code=503, detail="Azure sandbox configuration is incomplete.")
     return {"status": "ready"}
 
 

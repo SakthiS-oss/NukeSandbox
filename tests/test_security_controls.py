@@ -136,6 +136,36 @@ def test_gemini_prompt_never_includes_target_url_or_hostname() -> None:
     assert "<TARGET_HOST>" in prompt
 
 
+def test_azure_job_keeps_malicious_url_as_one_argument() -> None:
+    malicious_url = "https://example.com; touch /tmp/pwned"
+    body = main._azure_job_start_body(malicious_url)
+    container = body["containers"][0]
+
+    assert container["name"] == "curl"
+    assert container["image"] == main.SANDBOX_IMAGE
+    assert container["command"] == ["curl"]
+    assert container["args"][-1] == malicious_url
+    assert container["args"][:5] == ["-v", "-s", "-L", "--max-time", "8"]
+
+
+def test_selected_sandbox_dispatches_azure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SANDBOX_EXECUTION_MODE", "azure")
+    monkeypatch.setattr(main, "_run_azure_sandbox", lambda target: f"azure:{target}")
+
+    assert main._run_selected_sandbox("https://example.com") == "azure:https://example.com"
+
+
+def test_ready_requires_azure_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    monkeypatch.setenv("SANDBOX_EXECUTION_MODE", "azure")
+    monkeypatch.delenv("AZURE_SUBSCRIPTION_ID", raising=False)
+    monkeypatch.delenv("AZURE_RESOURCE_GROUP", raising=False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        main.readiness()
+    assert exc_info.value.status_code == 503
+
+
 def test_kubernetes_sandbox_matches_docker_hardening() -> None:
     pod = main._kubernetes_sandbox_pod("https://example.com")
     spec = pod.spec

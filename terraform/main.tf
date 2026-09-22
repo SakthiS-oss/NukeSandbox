@@ -1,71 +1,60 @@
-resource "kubernetes_namespace_v1" "nukesandbox" {
-  metadata {
-    name = var.namespace
-    labels = {
-      "app.kubernetes.io/part-of"          = "nukesandbox"
-      "pod-security.kubernetes.io/enforce" = "restricted"
-    }
+resource "random_string" "suffix" {
+  length  = 6
+  special = false
+  upper   = false
+}
+
+locals {
+  prefix = var.name_prefix
+  suffix = random_string.suffix.result
+  tags = {
+    app         = "nukesandbox"
+    environment = "azure"
   }
 }
 
-resource "kubernetes_service_account_v1" "api" {
-  metadata {
-    name      = "nukesandbox-api"
-    namespace = kubernetes_namespace_v1.nukesandbox.metadata[0].name
-  }
+resource "azurerm_resource_group" "main" {
+  name     = "rg-${local.prefix}"
+  location = var.location
+  tags     = local.tags
 }
 
-resource "kubernetes_role_v1" "sandbox_runner" {
-  metadata {
-    name      = "sandbox-runner"
-    namespace = kubernetes_namespace_v1.nukesandbox.metadata[0].name
-  }
-
-  rule {
-    api_groups = [""]
-    resources  = ["pods"]
-    verbs      = ["create", "get", "delete"]
-  }
-
-  rule {
-    api_groups = [""]
-    resources  = ["pods/log"]
-    verbs      = ["get"]
-  }
+resource "azurerm_log_analytics_workspace" "main" {
+  name                = "log-${local.prefix}-${local.suffix}"
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+  tags                = local.tags
 }
 
-resource "kubernetes_role_binding_v1" "sandbox_runner" {
-  metadata {
-    name      = "sandbox-runner"
-    namespace = kubernetes_namespace_v1.nukesandbox.metadata[0].name
-  }
-
-  role_ref {
-    api_group = "rbac.authorization.k8s.io"
-    kind      = "Role"
-    name      = kubernetes_role_v1.sandbox_runner.metadata[0].name
-  }
-
-  subject {
-    kind      = "ServiceAccount"
-    name      = kubernetes_service_account_v1.api.metadata[0].name
-    namespace = kubernetes_namespace_v1.nukesandbox.metadata[0].name
-  }
+resource "azurerm_container_registry" "main" {
+  name                = "${replace(local.prefix, "-", "")}${local.suffix}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  sku                 = "Basic"
+  admin_enabled       = false
+  tags                = local.tags
 }
 
-resource "kubernetes_resource_quota_v1" "sandbox" {
-  metadata {
-    name      = "sandbox-limits"
-    namespace = kubernetes_namespace_v1.nukesandbox.metadata[0].name
-  }
+resource "azurerm_container_app_environment" "main" {
+  name                       = "cae-${local.prefix}"
+  location                   = azurerm_resource_group.main.location
+  resource_group_name        = azurerm_resource_group.main.name
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.main.id
+  tags                       = local.tags
+}
 
-  spec {
-    hard = {
-      "pods"            = "20"
-      "requests.cpu"    = "2"
-      "requests.memory" = "2Gi"
-      "limits.cpu"      = "4"
-      "limits.memory"   = "4Gi"
-    }
-  }
+resource "azurerm_user_assigned_identity" "api" {
+  name                = "id-${local.prefix}-api"
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  tags                = local.tags
+}
+
+resource "azurerm_user_assigned_identity" "github" {
+  name                = "id-${local.prefix}-github"
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  tags                = local.tags
 }
