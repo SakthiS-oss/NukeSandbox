@@ -19,5 +19,9 @@ frontend/tsconfig.tsbuildinfo
 # Security scan and IaC state artifacts
 .semgrep/
 terraform/.terraform/
+terraform/kubernetes/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.*
+terraform/kubernetes/*.tfstate
+terraform/kubernetes/*.tfstate.*
+terraform/terraform.tfvars

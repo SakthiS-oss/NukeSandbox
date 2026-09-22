@@ -1,11 +1,23 @@
 terraform {
   required_version = ">= 1.5.0"
   required_providers {
-    kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.32" }
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 4.40"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
   }
 }
 
-provider "kubernetes" {
-  config_path    = var.kubeconfig_path
-  config_context = var.kubeconfig_context
+provider "azurerm" {
+  features {
+    key_vault {
+      purge_soft_delete_on_destroy = false
+    }
+  }
 }
+
+data "azurerm_client_config" "current" {}

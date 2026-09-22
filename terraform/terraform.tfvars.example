@@ -1,0 +1,8 @@
+location          = "eastus"
+name_prefix       = "nukesandbox"
+github_repository = "SakthiS-oss/NukeSandbox"
+
+# terraform apply -var="google_api_key=$GOOGLE_API_KEY" -var="api_key_hashes=$API_KEY_HASHES"
+# Do not write real secrets into this file.
+google_api_key = "replace-with-gemini-key"
+api_key_hashes = "{\"portfolio-user\":\"replace-with-sha256-digest\"}"

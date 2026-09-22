@@ -5,9 +5,10 @@ NukeSandbox is a security-focused URL triage service. It runs a target URL in a 
 ## What this portfolio project demonstrates
 
 - **Least-privilege sandboxing:** no Linux capabilities, no privilege escalation, read-only filesystems, CPU/memory/PID limits, and an execution deadline.
-- **Kubernetes-native execution:** in-cluster mode creates a disposable restricted Pod for every inspection; the API service has namespace-scoped RBAC only for creating, reading logs from, and deleting those Pods.
-- **Infrastructure as code:** Terraform provisions the namespace, restricted service account, Role/RoleBinding, and resource quota. It deliberately uses an existing cluster context so cloud credentials and cluster lifecycle remain separate from application state.
-- **Secrets management:** production configuration uses External Secrets Operator (ESO) to materialize `GOOGLE_API_KEY` from a `ClusterSecretStore`; no secret is included in Git, the image, or a Kubernetes manifest.
+- **Azure Container Apps execution:** production mode on this branch starts a disposable Container Apps Job for every inspection. The API identity can start, read, and stop that job only.
+- **Azure Container Registry:** CI publishes a SHA-tagged, Trivy-scanned image to ACR and deploys the digest. Registry admin credentials stay off.
+- **Infrastructure as code:** Terraform provisions the resource group, ACR, Container Apps environment, API app, sandbox job, Key Vault, managed identities, and GitHub OIDC. The original Kubernetes Terraform remains under `terraform/kubernetes`.
+- **Secrets management:** Azure Key Vault stores `GOOGLE_API_KEY` and `API_KEY_HASHES`; the Container App references them through a user-assigned identity. No secret is included in Git or the image.
 - **Security gates:** GitHub Actions runs endpoint/security tests, Semgrep, and Trivy before publishing; release images receive an SPDX SBOM, build provenance attestation, and GitHub OIDC/Cosign signature that CD verifies before deployment.
 - **Operability:** request IDs and OpenTelemetry spans correlate API, sandbox, and Gemini work. JSON logs are friendly to Loki/ELK-style collectors; Prometheus metrics expose request outcomes, sandbox duration, and cleanup outcomes at `/metrics`.
 - **Abuse resistance:** URL DNS preflight blocks non-public addresses, and optional Redis-backed per-client quotas fail closed when the rate limiter is unavailable.
@@ -16,15 +17,17 @@ NukeSandbox is a security-focused URL triage service. It runs a target URL in a 
 ## Architecture
 
 ```text
-GitHub Actions ── Semgrep + Trivy ──> build/scan image ──> Kubernetes deployment
-                                                        │
-Client ──> FastAPI ──(request ID + rate limit)──> temporary curl Pod ──> telemetry
+GitHub Actions (OIDC) ── Semgrep + Trivy ──> ACR ──> Azure Container App
+                                                      │
+Client ──> FastAPI ──(request ID + rate limit)──> Container Apps Job ──> telemetry
               │                                             │
-              ├── JSON logs + OTEL traces                   └── removed on completion
-              └── /metrics ──> Prometheus/Grafana/alerts
+              ├── JSON logs + OTEL traces                   └── job replica exits
+              └── /metrics
 
-External Secrets Operator ──> Kubernetes Secret ──> GOOGLE_API_KEY
+Azure Key Vault ──> Container App secrets ──> GOOGLE_API_KEY
 ```
+
+See `docs/azure.md` for the apply steps and GitHub secret mapping. Kubernetes remains available locally and under `terraform/kubernetes`.
 
 ## Local development
 
@@ -43,13 +46,31 @@ pytest
 
 Local mode defaults to the Docker runner. It uses a digest-pinned `curlimages/curl` image, which contains curl, instead of assuming the base Alpine image includes it. Visit `http://localhost:8000`; health and metrics are at `/health` and `/metrics`. When `API_AUTH_REQUIRED=true`, enter the raw API key in the dashboard field so the UI can send `X-API-Key`.
 
+## Azure deployment
+
+1. Sign in with Azure CLI and apply Terraform from `terraform/`:
+
+   ```bash
+   az login
+   cd terraform
+   terraform init
+   terraform apply \
+     -var="google_api_key=$GOOGLE_API_KEY" \
+     -var="api_key_hashes=$API_KEY_HASHES"
+   ```
+
+2. Copy `terraform output` values into the GitHub `production` environment secrets listed in `docs/azure.md`.
+3. Push this `Azure` branch. The workflow scans, publishes `nukesandbox:<sha>` to ACR, and updates the Container App to that digest.
+
+The API uses `SANDBOX_EXECUTION_MODE=azure`. It never mounts a Docker socket.
+
 ## Kubernetes deployment
 
 1. Point `kubectl` and Terraform at a cluster. For a local demo, create one with kind or minikube.
 2. Provision the isolated application boundary:
 
    ```bash
-   cd terraform
+   cd terraform/kubernetes
    terraform init
    terraform apply
    ```
@@ -79,7 +100,7 @@ See `docs/threat-model.md` for trust boundaries, attack paths, mitigations, and 
 
 ### Required GitHub repository settings
 
-Add `KUBECONFIG_DATA` as a protected environment secret, containing base64-encoded kubeconfig for a least-privilege deployment identity. Update the image name in `k8s/deployment.yaml` to your GHCR organization. Protect `main` so the **Security-gated build and deploy** check is required before merge.
+Add the Azure OIDC and ACR secrets from `terraform output` as documented in `docs/azure.md`. Protect the `Azure` branch so **Azure security-gated build and deploy** is required before merge. The Kubernetes path still accepts `KUBECONFIG_DATA` if you deploy with the original workflow on `main`.
 
 ## Security notes
 
@@ -109,4 +130,4 @@ unset API_KEY
 
 Set the resulting value in the External Secret `nukesandbox/api-key-hashes`, for example `{"portfolio-user":"<sha256-digest>"}`. The API accepts the raw key only in the `X-API-Key` request header and uses the mapped identity for quota enforcement. The dashboard has a matching API-key field; the key stays in `sessionStorage` for the browser tab and is never written to the analysis prompt sent to Gemini.
 
-Kubernetes mode sets `REQUIRE_EGRESS_PROXY=true`: sandbox Pods may reach only cluster DNS and `nukesandbox-egress-proxy`. The proxy denies non-public destination ranges on every connection, including redirected requests. The Squid image in `k8s/egress-proxy.yaml` is pinned to a multi-arch digest. CI publishes the API image as `:${{ github.sha }}` only (never `:latest`) and deploys the Cosign-verified digest.
+Azure mode stores API-key hashes in Key Vault and publishes `:${{ github.sha }}` to ACR (never `:latest`). Kubernetes mode can still set `REQUIRE_EGRESS_PROXY=true` so sandbox Pods reach only cluster DNS and `nukesandbox-egress-proxy`. The Squid image in `k8s/egress-proxy.yaml` is digest-pinned.
