@@ -16,19 +16,6 @@ variable "github_repository" {
   description = "GitHub owner/name used for OIDC federated credentials."
 }
 
-variable "google_api_key" {
-  type        = string
-  sensitive   = true
-  description = "Gemini API key stored in Key Vault and injected into the Container App. Never commit this value."
-}
-
-variable "api_key_hashes" {
-  type        = string
-  sensitive   = true
-  default     = "{}"
-  description = "JSON map of identity to SHA-256 API-key digest, stored in Key Vault as API_KEY_HASHES."
-}
-
 variable "api_image" {
   type        = string
   default     = "mcr.microsoft.com/k8se/quickstart:latest"
@@ -42,11 +29,13 @@ variable "sandbox_image" {
 }
 
 variable "min_replicas" {
-  type    = number
-  default = 1
+  type        = number
+  default     = 0
+  description = "API scale-to-zero default keeps the Consumption plan idle-cost at zero."
 }
 
 variable "max_replicas" {
-  type    = number
-  default = 3
+  type        = number
+  default     = 1
+  description = "Cap replicas at one to avoid surprise Consumption scale-out."
 }

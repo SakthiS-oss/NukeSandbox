@@ -30,6 +30,13 @@ output "key_vault_name" {
   value = azurerm_key_vault.main.name
 }
 
+output "set_secrets_commands" {
+  value = [
+    "az keyvault secret set --vault-name ${azurerm_key_vault.main.name} --name google-api-key --value \"$GOOGLE_API_KEY\"",
+    "az keyvault secret set --vault-name ${azurerm_key_vault.main.name} --name api-key-hashes --value \"$API_KEY_HASHES\"",
+  ]
+}
+
 output "github_client_id" {
   value       = azurerm_user_assigned_identity.github.client_id
   description = "Set this as the GitHub Actions secret AZURE_CLIENT_ID for OIDC login."
