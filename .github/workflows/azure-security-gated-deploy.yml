@@ -21,6 +21,10 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
       - run: pytest -q --cov=main --cov-report=term-missing
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive terraform
 
   sast-and-dependency-scan:
     needs: test

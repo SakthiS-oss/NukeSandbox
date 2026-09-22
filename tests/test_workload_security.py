@@ -49,8 +49,13 @@ def test_azure_terraform_provisions_acr_container_apps_and_key_vault() -> None:
     assert "azurerm_container_app_job" in sources
     assert "azurerm_key_vault" in sources
     assert "azurerm_federated_identity_credential" in sources
-    assert 'SANDBOX_EXECUTION_MODE"' in sources or "SANDBOX_EXECUTION_MODE" in sources
+    assert "SANDBOX_EXECUTION_MODE" in sources
     assert "nukesandbox-sandbox" in sources
+    assert "azurerm_container_app_job.sandbox.id" in sources
+    assert "REPLACE_ME" in sources
+    assert "github_deployer" in sources
+    assert "scale-to-zero" in sources
+    assert "Contributor" not in sources
 
 
 def test_azure_ci_publishes_to_acr_not_latest() -> None:

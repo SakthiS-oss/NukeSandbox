@@ -22,18 +22,28 @@ resource "azurerm_role_assignment" "api_kv_user" {
   principal_id         = azurerm_user_assigned_identity.api.principal_id
 }
 
+# Placeholder values only. Set the real secrets with Azure CLI after apply so
+# they never enter Terraform state. See docs/azure.md.
 resource "azurerm_key_vault_secret" "google_api_key" {
   name         = "google-api-key"
-  value        = var.google_api_key
+  value        = "REPLACE_ME"
   key_vault_id = azurerm_key_vault.main.id
+
+  lifecycle {
+    ignore_changes = [value]
+  }
 
   depends_on = [azurerm_role_assignment.terraform_kv_officer]
 }
 
 resource "azurerm_key_vault_secret" "api_key_hashes" {
   name         = "api-key-hashes"
-  value        = var.api_key_hashes
+  value        = "{}"
   key_vault_id = azurerm_key_vault.main.id
+
+  lifecycle {
+    ignore_changes = [value]
+  }
 
   depends_on = [azurerm_role_assignment.terraform_kv_officer]
 }

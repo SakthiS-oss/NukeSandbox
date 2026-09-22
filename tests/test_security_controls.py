@@ -142,8 +142,8 @@ def test_azure_job_keeps_malicious_url_as_one_argument() -> None:
     container = body["containers"][0]
 
     assert container["name"] == "curl"
-    assert container["image"] == main.SANDBOX_IMAGE
-    assert container["command"] == ["curl"]
+    assert "image" not in container
+    assert "command" not in container
     assert container["args"][-1] == malicious_url
     assert container["args"][:5] == ["-v", "-s", "-L", "--max-time", "8"]
 
