@@ -38,6 +38,7 @@ def test_ci_publishes_immutable_tags_not_latest() -> None:
     assert "ghcr.io/${{ github.repository }}:latest" not in workflow
     assert "cosign verify" in workflow
     assert "set image" in workflow
+    assert "branches: [kubernetes]" in workflow
 
 
 def test_azure_terraform_provisions_acr_container_apps_and_key_vault() -> None:
@@ -66,6 +67,8 @@ def test_azure_ci_publishes_to_acr_not_latest() -> None:
     assert "az containerapp update" in workflow
     assert "nukesandbox@$DIGEST" in workflow
     assert ":latest" not in workflow
+    assert "branches: [main]" in workflow
+    assert "refs/heads/Azure" not in workflow
 
 
 def test_admission_policy_covers_forbidden_workload_settings() -> None:

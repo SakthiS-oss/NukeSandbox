@@ -2,7 +2,7 @@
 
 NukeSandbox inspects a URL in a short-lived sandbox, then turns the HTTP telemetry into a plain-language risk report with Gemini.
 
-This `Azure` branch runs that path on **Azure Container Apps** and **Azure Container Registry**. Each inspection is a disposable Container Apps Job. The API never mounts a Docker socket.
+This `main` branch runs that path on **Azure Container Apps** and **Azure Container Registry**. Each inspection is a disposable Container Apps Job. The API never mounts a Docker socket.
 
 ## What this branch demonstrates
 
@@ -12,7 +12,7 @@ This `Azure` branch runs that path on **Azure Container Apps** and **Azure Conta
 - **Cheap by default:** Consumption plan, API scale-to-zero, one replica max, 7-day Log Analytics retention, no Redis, no Front Door, no VNet.
 - **Security gates:** GitHub Actions runs pytest, Semgrep, Trivy, and `terraform fmt` before publishing `nukesandbox:<sha>` to ACR and deploying that digest.
 
-Local Docker and the Kubernetes Terraform under `terraform/kubernetes/` still work if you want those runners.
+Local Docker still works. The Kubernetes path lives on the `kubernetes` branch and under `terraform/kubernetes/`.
 
 ## Architecture
 
@@ -97,7 +97,7 @@ Open `http://localhost:8000`. Local mode uses Docker and a digest-pinned `curlim
    | `AZURE_RESOURCE_GROUP` | `resource_group_name` |
    | `ACR_LOGIN_SERVER` | `acr_login_server` |
 
-4. Protect the `Azure` branch so **Azure security-gated build and deploy** is required. Push this branch. CI publishes the scanned digest and updates the Container App.
+4. Protect `main` so **Azure security-gated build and deploy** is required. Push to `main`. CI publishes the scanned digest and updates the Container App.
 
 5. Open `https://$(terraform output -raw container_app_fqdn)`. Enter the raw API key in the dashboard. The first request after idle can take longer because the API scales from zero.
 
@@ -115,13 +115,4 @@ Send the raw API key in `X-API-Key` when authentication is enabled. `GET /health
 
 ## Kubernetes (optional)
 
-The original cluster path is unchanged:
-
-```bash
-cd terraform/kubernetes
-terraform init
-terraform apply
-kubectl apply -k k8s
-```
-
-That path can still use an egress proxy, Redis quotas, Kyverno, and Cosign. See `docs/threat-model.md`.
+The original cluster path lives on the [`kubernetes`](https://github.com/SakthiS-oss/NukeSandbox/tree/kubernetes) branch. Check it out and follow that README (`cd terraform && terraform apply`, then `kubectl apply -k k8s`). That path can still use an egress proxy, Redis quotas, Kyverno, and Cosign.
