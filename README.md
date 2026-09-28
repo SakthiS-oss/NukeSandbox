@@ -2,6 +2,8 @@
 
 NukeSandbox is a security-focused URL triage service. It runs a target URL in a short-lived, non-root sandbox, turns network telemetry into a plain-language assessment with Gemini, and demonstrates a production-minded DevSecOps delivery path.
 
+This `kubernetes` branch is the original cluster deploy path. Azure Container Apps lives on `main`.
+
 ## What this portfolio project demonstrates
 
 - **Least-privilege sandboxing:** no Linux capabilities, no privilege escalation, read-only filesystems, CPU/memory/PID limits, and an execution deadline.
@@ -79,7 +81,7 @@ See `docs/threat-model.md` for trust boundaries, attack paths, mitigations, and 
 
 ### Required GitHub repository settings
 
-Add `KUBECONFIG_DATA` as a protected environment secret, containing base64-encoded kubeconfig for a least-privilege deployment identity. Update the image name in `k8s/deployment.yaml` to your GHCR organization. Protect `main` so the **Security-gated build and deploy** check is required before merge.
+Add `KUBECONFIG_DATA` as a protected environment secret, containing base64-encoded kubeconfig for a least-privilege deployment identity. Update the image name in `k8s/deployment.yaml` to your GHCR organization. Protect `kubernetes` so the **Security-gated build and deploy** check is required before merge.
 
 ## Security notes
 
