@@ -2,8 +2,9 @@ name: Security-gated build and deploy
 
 on:
   pull_request:
+    branches: [kubernetes]
   push:
-    branches: [main]
+    branches: [kubernetes]
   workflow_dispatch:
 
 permissions:
@@ -78,7 +79,7 @@ jobs:
 
   sign-image:
     needs: build-and-image-scan
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/kubernetes' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -90,7 +91,7 @@ jobs:
 
   attest-and-publish-sbom:
     needs: build-and-image-scan
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/kubernetes' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       attestations: write
@@ -119,7 +120,7 @@ jobs:
 
   deploy:
     needs: [build-and-image-scan, sign-image, attest-and-publish-sbom]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/kubernetes' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: production
     steps:
@@ -136,7 +137,7 @@ jobs:
           IMAGE: ${{ needs.build-and-image-scan.outputs.image }}
         run: |
           cosign verify \
-            --certificate-identity "https://github.com/SakthiS-oss/NukeSandbox/.github/workflows/security-gated-deploy.yml@refs/heads/main" \
+            --certificate-identity "https://github.com/SakthiS-oss/NukeSandbox/.github/workflows/security-gated-deploy.yml@refs/heads/kubernetes" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "$IMAGE"
           kubectl apply -k k8s
