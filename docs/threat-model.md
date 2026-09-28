@@ -21,7 +21,7 @@ The API accepts an untrusted URL, executes `curl` in a disposable sandbox, sends
 | SSRF to localhost, RFC1918, or cloud metadata | DNS preflight rejects non-global addresses; tests cover loopback, private, metadata, and mixed answers. | DNS rebinding after preflight requires CNI/egress-proxy enforcement. |
 | Sandbox cost exhaustion | Kubernetes mode can use Redis quotas and Pod quotas. Azure mode keeps cost down with API-key auth, a 15-second Job timeout, scale-to-zero, and `max_replicas = 1`. | Azure mode has no Redis/WAF. Distributed clients with a valid key can still start jobs until you add a cache or Front Door. |
 | Secret leakage | API key is injected from External Secrets Operator or Azure Key Vault. The raw target URL and hostname are stripped from the Gemini prompt; telemetry mentions are replaced with `<TARGET_URL>` / `<TARGET_HOST>`. | Telemetry can contain sensitive remote content; retention must be controlled in the log platform. |
-| Compromised build/deployment | Semgrep, Trivy, and digest-only ACR deploys on the Azure branch. The Kubernetes path can add Cosign, Kyverno, and GitOps. GitHub's Azure identity can update the API image only. | Azure CI does not yet verify a Cosign signature before `az containerapp update`. |
+| Compromised build/deployment | Semgrep, Trivy, and digest-only ACR deploys on `main`. The `kubernetes` branch can add Cosign, Kyverno, and GitOps. GitHub's Azure identity can update the API image only. | Azure CI does not yet verify a Cosign signature before `az containerapp update`. |
 
 ## Security verification
 

@@ -2,9 +2,9 @@ name: Azure security-gated build and deploy
 
 on:
   pull_request:
-    branches: [Azure]
+    branches: [main]
   push:
-    branches: [Azure]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -85,7 +85,7 @@ jobs:
 
   deploy:
     needs: [build-and-image-scan]
-    if: github.ref == 'refs/heads/Azure' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: production
     steps:

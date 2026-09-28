@@ -38,7 +38,7 @@ Terraform creates:
 - User-assigned identities for the API and for GitHub Actions
 - The `nukesandbox-api` Container App (scale-to-zero, max 1 replica) and the `nukesandbox-sandbox` Job
 - A job-scoped custom role for the API and an image-update role for GitHub
-- GitHub OIDC federated credentials for the `Azure` branch and the `production` environment
+- GitHub OIDC federated credentials for `main` and the `production` environment
 
 The first Container App revision uses the public quickstart image. CI replaces it with the scanned ACR digest. Until that happens, `/ready` will fail if the Gemini key is still `REPLACE_ME`.
 
@@ -52,7 +52,7 @@ The first Container App revision uses the public quickstart image. CI replaces i
 | `AZURE_RESOURCE_GROUP` | `resource_group_name` |
 | `ACR_LOGIN_SERVER` | `acr_login_server` |
 
-Protect the `Azure` branch so **Azure security-gated build and deploy** is required.
+Protect `main` so **Azure security-gated build and deploy** is required.
 
 ## Keeping the bill low
 
