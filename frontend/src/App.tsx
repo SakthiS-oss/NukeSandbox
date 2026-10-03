@@ -20,6 +20,51 @@ type AnalyzeResponse = {
   report: SecurityReport;
 };
 
+type JobRecord = {
+  job_id: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  stage: string;
+  target_url: string;
+  result: AnalyzeResponse | null;
+  error: string | null;
+};
+
+function authHeaders(apiKey: string): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey.trim()) {
+    headers["X-API-Key"] = apiKey.trim();
+  }
+  return headers;
+}
+
+async function wait(ms: number): Promise<void> {
+  await new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function pollJob(
+  jobId: string,
+  headers: Record<string, string>,
+  onStage: (stage: string) => void,
+): Promise<AnalyzeResponse> {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const response = await fetch(`/api/jobs/${jobId}`, { headers });
+    const job = (await response.json()) as JobRecord | { detail?: unknown };
+    if (!response.ok) {
+      throw new Error(formatApiError((job as { detail?: unknown }).detail, "Job lookup failed."));
+    }
+    const record = job as JobRecord;
+    onStage(record.stage);
+    if (record.status === "succeeded" && record.result) {
+      return record.result;
+    }
+    if (record.status === "failed") {
+      throw new Error(record.error ?? "Analysis failed.");
+    }
+    await wait(1000);
+  }
+  throw new Error("Analysis timed out waiting for the worker.");
+}
+
 const API_KEY_STORAGE = "nukesandbox.api-key";
 
 function readStoredApiKey(): string {
@@ -71,23 +116,27 @@ export function App(): JSX.Element {
     setStatus("Launching sandbox and collecting telemetry...");
 
     try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (apiKey.trim()) {
-        headers["X-API-Key"] = apiKey.trim();
-      }
-
+      const headers = authHeaders(apiKey);
       const response = await fetch("/api/analyze", {
         method: "POST",
         headers,
         body: JSON.stringify({ target_url: url.trim() }),
       });
 
-      const payload = (await response.json()) as AnalyzeResponse | { detail?: unknown };
+      const payload = (await response.json()) as AnalyzeResponse | JobRecord | { job_id?: string; detail?: unknown };
       if (!response.ok) {
         throw new Error(formatApiError((payload as { detail?: unknown }).detail, "Analysis failed."));
       }
 
-      setData(payload as AnalyzeResponse);
+      if (response.status === 202 && "job_id" in payload && typeof payload.job_id === "string") {
+        setStatus("Queued for the Pekko worker...");
+        const result = await pollJob(payload.job_id, headers, (stage) => {
+          setStatus(`Worker stage: ${stage}`);
+        });
+        setData(result);
+      } else {
+        setData(payload as AnalyzeResponse);
+      }
       setStatus("Analysis complete.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unexpected error.");

@@ -11,7 +11,7 @@ WORKDIR /app
 RUN addgroup --system app && adduser --system --ingroup app app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py ./
+COPY main.py jobs.py ./
 COPY --from=frontend-build /src/frontend/dist ./frontend/dist
 USER app
 EXPOSE 8000

@@ -11,6 +11,7 @@ This `main` branch runs that path on **Azure Container Apps** and **Azure Contai
 - **Secrets stay out of Git and Terraform state:** Key Vault holds `GOOGLE_API_KEY` and `API_KEY_HASHES`. Terraform creates placeholder secrets; you set the real values with Azure CLI.
 - **Cheap by default:** Consumption plan, API scale-to-zero, one replica max, 7-day Log Analytics retention, no Redis, no Front Door, no VNet.
 - **Security gates:** GitHub Actions runs pytest, Semgrep, Trivy, and `terraform fmt` before publishing `nukesandbox:<sha>` to ACR and deploying that digest.
+- **Distributed analysis (optional, local):** Kafka plus a Scala Pekko (Akka-model) worker turn `POST /api/analyze` into an async job with backpressure and at-least-once delivery. See `docs/distributed-systems.md`.
 
 Local Docker still works. The Kubernetes path lives on the `kubernetes` branch and under `terraform/kubernetes/`.
 
@@ -22,6 +23,9 @@ GitHub Actions (OIDC) ── pytest + Semgrep + Trivy ──> ACR digest ──>
 Client ── X-API-Key ──> FastAPI ──> Container Apps Job (curl) ──> Gemini
                  │                         │
                  └── Key Vault secrets     └── replica exits (stopped on failure)
+
+Optional local path:
+Client ── 202 job_id ──> Kafka (job_id key) ──> Pekko worker ──> /internal/execute
 ```
 
 ## Cost notes
@@ -56,6 +60,18 @@ pytest
 ```
 
 Open `http://localhost:8000`. Local mode uses Docker and a digest-pinned `curlimages/curl` image. Health and metrics are at `/health` and `/metrics`. If you set `API_AUTH_REQUIRED=true`, enter the raw API key in the dashboard field.
+
+To demo Kafka + Pekko instead of the synchronous API:
+
+```bash
+docker compose up -d kafka
+export KAFKA_BOOTSTRAP_SERVERS=localhost:9094 INTERNAL_API_TOKEN=dev-internal-token
+python3 main.py
+# other terminal
+cd worker && INTERNAL_API_TOKEN=dev-internal-token sbt run
+```
+
+The dashboard polls `GET /api/jobs/{id}` after a `202`. Leave Kafka unset on Azure so you do not add Event Hubs or a VM to the bill.
 
 ## Azure deployment
 
@@ -111,7 +127,7 @@ More detail, including residual risk, is in `docs/azure.md`.
 { "target_url": "https://example.com" }
 ```
 
-Send the raw API key in `X-API-Key` when authentication is enabled. `GET /health` is liveness. `GET /ready` fails until `GOOGLE_API_KEY` and the Azure job settings are present. `GET /metrics` is Prometheus text.
+Send the raw API key in `X-API-Key` when authentication is enabled. With Kafka enabled, the same route returns `202` and `GET /api/jobs/{job_id}` is the poll endpoint. `GET /health` is liveness. `GET /ready` fails until `GOOGLE_API_KEY` and the Azure job settings are present. `GET /metrics` is Prometheus text.
 
 ## Kubernetes (optional)
 

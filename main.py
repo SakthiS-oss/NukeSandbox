@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from docker.errors import APIError as DockerAPIError
 from docker.errors import DockerException
 from docker.errors import NotFound as DockerNotFound
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse
 from fastapi.responses import JSONResponse
@@ -46,6 +46,8 @@ from google.genai import types
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.exceptions import ApiException as KubernetesApiException
+
+from jobs import AnalyzeAccepted, JobRecord, build_analyze_command, get_job_store, kafka_enabled, publish_analyze_command
 
 
 class AnalyzeRequest(BaseModel):
@@ -255,10 +257,10 @@ async def add_request_context_and_rate_limit(request, call_next):
             span.set_attribute("http.request.method", request.method)
             span.set_attribute("url.path", request.url.path)
             span.set_attribute("nukesandbox.request_id", request_id)
-            if request.url.path == "/api/analyze":
+            if request.url.path == "/api/analyze" or request.url.path.startswith("/api/jobs"):
                 identity = _authenticate_api_key(request.headers.get("X-API-Key"))
                 identity_token = identity_context.set(identity)
-                if RATE_LIMIT_ENABLED:
+                if request.url.path == "/api/analyze" and RATE_LIMIT_ENABLED:
                     _enforce_rate_limit(identity if API_AUTH_REQUIRED else (request.client.host if request.client else "unknown"))
             response = await call_next(request)
             response.headers["X-Request-ID"] = request_id
@@ -735,15 +737,16 @@ def _request_security_report(client: genai.Client, chosen_model: str, prompt: st
     raise RuntimeError("Model returned no parsable content.")
 
 
-@app.post("/api/analyze", response_model=AnalyzeResponse)
-def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
-    target_url = str(payload.target_url)
-
+def _prepare_target_url(target_url: str) -> str:
     parsed = urlparse(target_url)
     if parsed.scheme not in {"http", "https"}:
         raise HTTPException(status_code=400, detail="Only http and https URLs are supported.")
     _validate_public_target(target_url)
+    return target_url
 
+
+def _run_analysis(target_url: str) -> AnalyzeResponse:
+    """Shared sandbox + Gemini path used by the sync API and the Pekko worker."""
     slot_acquired = False
     try:
         if CONCURRENCY_LIMIT_ENABLED:
@@ -774,6 +777,92 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     finally:
         if slot_acquired:
             _release_sandbox_slot()
+
+
+def _require_internal_token(provided: str | None) -> None:
+    expected = os.getenv("INTERNAL_API_TOKEN")
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="A valid X-Internal-Token is required.")
+
+
+@app.post("/api/analyze", response_model=None)
+def analyze(payload: AnalyzeRequest) -> AnalyzeResponse | JSONResponse:
+    target_url = _prepare_target_url(str(payload.target_url))
+    if not kafka_enabled():
+        return _run_analysis(target_url)
+
+    command = build_analyze_command(target_url, identity_context.get(), request_id_context.get())
+    record = JobRecord(
+        job_id=command.job_id,
+        status="queued",
+        stage="queued",
+        target_url=target_url,
+        identity=command.requested_by,
+        created_at=command.created_at,
+    )
+    get_job_store().create(record)
+    try:
+        publish_analyze_command(command)
+    except Exception as exc:
+        get_job_store().update(command.job_id, status="failed", stage="publish", error="Failed to enqueue analysis.")
+        logger.warning("analysis_enqueue_failed")
+        raise HTTPException(status_code=503, detail="Analysis queue is unavailable.") from exc
+    accepted = AnalyzeAccepted(job_id=command.job_id, poll_url=f"/api/jobs/{command.job_id}")
+    return JSONResponse(status_code=202, content=accepted.model_dump())
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str) -> JobRecord:
+    record = get_job_store().get(job_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Analysis job was not found.")
+    identity = identity_context.get()
+    if API_AUTH_REQUIRED and record.identity != identity:
+        raise HTTPException(status_code=404, detail="Analysis job was not found.")
+    return record
+
+
+@app.post("/internal/execute", response_model=AnalyzeResponse)
+def internal_execute(
+    payload: AnalyzeRequest,
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+) -> AnalyzeResponse:
+    """Pekko worker entrypoint. Not part of the public API."""
+    _require_internal_token(x_internal_token)
+    return _run_analysis(_prepare_target_url(str(payload.target_url)))
+
+
+class JobEvent(BaseModel):
+    status: Literal["queued", "running", "succeeded", "failed"]
+    stage: str
+    result: dict | None = None
+    error: str | None = None
+
+
+@app.post("/internal/jobs/{job_id}/events", response_model=JobRecord)
+def internal_job_event(
+    job_id: str,
+    event: JobEvent,
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+) -> JobRecord:
+    """Idempotent job transitions from the Pekko worker (at-least-once Kafka delivery)."""
+    _require_internal_token(x_internal_token)
+    store = get_job_store()
+    current = store.get(job_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Analysis job was not found.")
+    if current.status in {"succeeded", "failed"}:
+        return current
+    updated = store.update(
+        job_id,
+        status=event.status,
+        stage=event.stage,
+        result=event.result,
+        error=event.error,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Analysis job was not found.")
+    return updated
 
 
 @app.get("/health")
