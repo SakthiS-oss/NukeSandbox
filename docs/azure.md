@@ -65,5 +65,5 @@ Protect `main` so **Azure security-gated build and deploy** is required.
 - Container Apps Jobs do not expose the same seccomp/capability knobs as Kubernetes Pods.
 - Job start still accepts an ARM template override. This API sends args only; a caller with the raw `jobs/start` permission could still supply another image.
 - There is no Redis quota on this branch. API keys and the 15-second job timeout are the cost controls.
-- Sandbox egress is not VNet-locked. The process-level DNS preflight still rejects non-public answers. Production egress lockdown needs a VNet or Azure Firewall.
+- Sandbox egress is not VNet-locked. The API validates and DNS-pins every hop, including redirects, so curl only connects to addresses that passed the public-IP check. Network-level lockdown still needs a VNet or Azure Firewall.
 - The curl image is pulled from Docker Hub by digest. Mirroring it into ACR is optional and adds a small storage charge.
