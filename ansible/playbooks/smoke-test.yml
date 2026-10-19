@@ -1,0 +1,90 @@
+---
+- name: Verify the deployed NukeSandbox API and its security controls
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    terraform_dir: "{{ playbook_dir }}/../../terraform"
+    probe_url: https://example.com
+    metadata_url: http://169.254.169.254/latest/meta-data/
+    analysis_timeout_seconds: 180
+
+  vars_prompt:
+    - name: api_key
+      prompt: Raw dashboard API key (input hidden)
+      private: true
+
+  tasks:
+    - name: Read the API hostname from Terraform
+      ansible.builtin.command:
+        argv: [terraform, "-chdir={{ terraform_dir }}", output, -raw, container_app_fqdn]
+      register: terraform_fqdn
+      changed_when: false
+      when: app_url is not defined
+
+    - name: Pick the API base URL
+      ansible.builtin.set_fact:
+        api_base_url: "{{ app_url if app_url is defined else 'https://' ~ terraform_fqdn.stdout }}"
+
+    - name: Wait for the API to wake from scale-to-zero
+      ansible.builtin.uri:
+        url: "{{ api_base_url }}/health"
+      register: health
+      retries: 12
+      delay: 10
+      until: health.status == 200
+
+    - name: Readiness confirms secrets and sandbox settings are loaded
+      ansible.builtin.uri:
+        url: "{{ api_base_url }}/ready"
+
+    - name: Analysis without an API key is rejected
+      ansible.builtin.uri:
+        url: "{{ api_base_url }}/api/analyze"
+        method: POST
+        body_format: json
+        body:
+          target_url: "{{ probe_url }}"
+        status_code: 401
+
+    - name: SSRF guard refuses the cloud metadata endpoint
+      ansible.builtin.uri:
+        url: "{{ api_base_url }}/api/analyze"
+        method: POST
+        headers:
+          X-API-Key: "{{ api_key }}"
+        body_format: json
+        body:
+          target_url: "{{ metadata_url }}"
+        status_code: 400
+      no_log: true
+
+    - name: Run a live analysis through the sandbox and Gemini
+      ansible.builtin.uri:
+        url: "{{ api_base_url }}/api/analyze"
+        method: POST
+        headers:
+          X-API-Key: "{{ api_key }}"
+        body_format: json
+        body:
+          target_url: "{{ probe_url }}"
+        timeout: "{{ analysis_timeout_seconds }}"
+      register: analysis
+      no_log: true
+      tags: [analysis]
+
+    - name: The report matches the API contract
+      ansible.builtin.assert:
+        that:
+          - analysis.json.report.risk_level in ['LOW', 'MEDIUM', 'HIGH']
+          - analysis.json.report.summary | length > 0
+          - analysis.json.report.technical_findings is sequence
+        quiet: true
+      tags: [analysis]
+
+    - name: Show the report
+      ansible.builtin.debug:
+        msg:
+          - "Risk level: {{ analysis.json.report.risk_level }}"
+          - "{{ analysis.json.report.summary }}"
+      tags: [analysis]

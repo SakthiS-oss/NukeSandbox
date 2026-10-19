@@ -1,0 +1,197 @@
+---
+- name: Provision Azure and wire up NukeSandbox secrets
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    terraform_dir: "{{ playbook_dir }}/../../terraform"
+    github_repository: SakthiS-oss/NukeSandbox
+    github_environment: production
+    configure_github: true
+    api_key_identity: portfolio-user
+    secret_propagation_retries: 12
+
+  vars_prompt:
+    - name: google_api_key
+      prompt: Gemini API key (input hidden)
+      private: true
+    - name: api_key
+      prompt: Raw dashboard API key, at least 16 characters. Only its SHA-256 digest is stored (input hidden)
+      private: true
+
+  pre_tasks:
+    - name: Require both secrets
+      ansible.builtin.assert:
+        that:
+          - google_api_key | length > 0
+          - api_key | length >= 16
+        fail_msg: Provide a Gemini API key and a dashboard API key of at least 16 characters.
+        quiet: true
+      no_log: true
+
+    - name: Check that the Azure CLI is signed in
+      ansible.builtin.command:
+        argv: [az, account, show, --output, none]
+      changed_when: false
+
+    - name: Check that the GitHub CLI is signed in
+      ansible.builtin.command:
+        argv: [gh, auth, status]
+      changed_when: false
+      when: configure_github | bool
+
+  tasks:
+    - name: Apply the Terraform stack
+      community.general.terraform:
+        project_path: "{{ terraform_dir }}"
+        state: present
+        force_init: true
+        variables:
+          github_repository: "{{ github_repository }}"
+      register: terraform
+
+    - name: Collect the Terraform outputs this playbook needs
+      ansible.builtin.set_fact:
+        key_vault_name: "{{ terraform.outputs.key_vault_name.value }}"
+        resource_group: "{{ terraform.outputs.resource_group_name.value }}"
+        container_app_name: "{{ terraform.outputs.container_app_name.value }}"
+        container_app_fqdn: "{{ terraform.outputs.container_app_fqdn.value }}"
+        github_secrets:
+          AZURE_CLIENT_ID: "{{ terraform.outputs.github_client_id.value }}"
+          AZURE_TENANT_ID: "{{ terraform.outputs.azure_tenant_id.value }}"
+          AZURE_SUBSCRIPTION_ID: "{{ terraform.outputs.azure_subscription_id.value }}"
+          AZURE_RESOURCE_GROUP: "{{ terraform.outputs.resource_group_name.value }}"
+          ACR_LOGIN_SERVER: "{{ terraform.outputs.acr_login_server.value }}"
+
+    - name: Build the Key Vault secret values
+      ansible.builtin.set_fact:
+        key_vault_secrets:
+          - name: google-api-key
+            value: "{{ google_api_key }}"
+          - name: api-key-hashes
+            value: "{{ {api_key_identity: api_key | hash('sha256')} | to_json }}"
+      no_log: true
+
+    # Terraform has just granted this user "Key Vault Secrets Officer"; Azure RBAC can
+    # take a minute or two to propagate, so the first reads are retried.
+    - name: Read the current Key Vault secret values
+      ansible.builtin.command:
+        argv:
+          - az
+          - keyvault
+          - secret
+          - show
+          - --vault-name
+          - "{{ key_vault_name }}"
+          - --name
+          - "{{ item.name }}"
+          - --query
+          - value
+          - --output
+          - tsv
+      loop: "{{ key_vault_secrets }}"
+      register: current_secrets
+      retries: "{{ secret_propagation_retries }}"
+      delay: 10
+      until: current_secrets.rc == 0
+      changed_when: false
+      no_log: true
+
+    # Secret values go through stdin, never argv, so they do not appear in the process list.
+    - name: Write Key Vault secrets whose values changed
+      ansible.builtin.command:
+        argv:
+          - az
+          - keyvault
+          - secret
+          - set
+          - --vault-name
+          - "{{ key_vault_name }}"
+          - --name
+          - "{{ item.0.name }}"
+          - --file
+          - /dev/stdin
+          - --output
+          - none
+        stdin: "{{ item.0.value }}"
+        stdin_add_newline: false
+      loop: "{{ key_vault_secrets | zip(current_secrets.results) | list }}"
+      when: item.0.value != item.1.stdout
+      changed_when: true
+      no_log: true
+      notify: Reload API secrets
+
+    - name: Create the GitHub deployment environment
+      ansible.builtin.command:
+        argv:
+          - gh
+          - api
+          - --method
+          - PUT
+          - "repos/{{ github_repository }}/environments/{{ github_environment }}"
+          - --silent
+      changed_when: false
+      when: configure_github | bool
+
+    - name: Store Terraform outputs as GitHub environment secrets
+      ansible.builtin.command:
+        argv:
+          - gh
+          - secret
+          - set
+          - "{{ item.key }}"
+          - --repo
+          - "{{ github_repository }}"
+          - --env
+          - "{{ github_environment }}"
+        stdin: "{{ item.value }}"
+        stdin_add_newline: false
+      loop: "{{ github_secrets | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      changed_when: true
+      when: configure_github | bool
+
+    - name: Show next steps
+      ansible.builtin.debug:
+        msg:
+          - "API URL: https://{{ container_app_fqdn }}"
+          - "Push to main so CI builds, scans, and deploys the API image."
+          - "Then verify the deployment: ansible-playbook playbooks/smoke-test.yml"
+
+  handlers:
+    - name: Find the active API revision
+      ansible.builtin.command:
+        argv:
+          - az
+          - containerapp
+          - revision
+          - list
+          - --name
+          - "{{ container_app_name }}"
+          - --resource-group
+          - "{{ resource_group }}"
+          - --query
+          - "[?properties.active].name | [0]"
+          - --output
+          - tsv
+      register: active_revision
+      changed_when: false
+      listen: Reload API secrets
+
+    - name: Restart the active API revision so it loads the new secrets
+      ansible.builtin.command:
+        argv:
+          - az
+          - containerapp
+          - revision
+          - restart
+          - --name
+          - "{{ container_app_name }}"
+          - --resource-group
+          - "{{ resource_group }}"
+          - --revision
+          - "{{ active_revision.stdout }}"
+      changed_when: true
+      when: active_revision.stdout | length > 0
+      listen: Reload API secrets

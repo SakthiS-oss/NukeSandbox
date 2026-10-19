@@ -25,3 +25,4 @@ terraform/*.tfstate.*
 terraform/kubernetes/*.tfstate
 terraform/kubernetes/*.tfstate.*
 terraform/terraform.tfvars
+ansible/.cache/

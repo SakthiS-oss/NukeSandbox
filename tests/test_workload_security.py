@@ -71,6 +71,29 @@ def test_azure_ci_publishes_to_acr_not_latest() -> None:
     assert "refs/heads/Azure" not in workflow
 
 
+def _playbook_tasks(name: str) -> list[dict]:
+    play = yaml.safe_load((ROOT / "ansible" / "playbooks" / name).read_text())[0]
+    return [*play.get("pre_tasks", []), *play.get("tasks", []), *play.get("handlers", [])]
+
+
+def test_ansible_never_logs_secrets_or_passes_them_as_arguments() -> None:
+    secret_markers = ("google_api_key", "api_key", "key_vault_secrets")
+    for playbook in ("bootstrap.yml", "smoke-test.yml"):
+        for task in _playbook_tasks(playbook):
+            if any(marker in yaml.safe_dump(task) for marker in secret_markers):
+                assert task.get("no_log") is True, f"{playbook}: '{task['name']}' handles a secret without no_log"
+            for arg in task.get("ansible.builtin.command", {}).get("argv", []):
+                templated_secret = "{{" in arg and any(marker in arg for marker in (*secret_markers, ".value"))
+                assert not templated_secret, f"{playbook}: '{task['name']}' puts a secret in argv; use stdin"
+
+
+def test_azure_ci_lints_ansible() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "azure-security-gated-deploy.yml").read_text()
+
+    assert "ansible-lint" in workflow
+    assert "--syntax-check" in workflow
+
+
 def test_admission_policy_covers_forbidden_workload_settings() -> None:
     policy = (ROOT / "policies" / "kyverno-nukesandbox.yaml").read_text()
 

@@ -87,6 +87,29 @@ Open `http://localhost:8000`. Local mode uses Docker and a digest-pinned `curlim
 
 ## Azure deployment
 
+### Quick path: Ansible
+
+`ansible/playbooks/bootstrap.yml` does steps 1–3 below in one run. It applies Terraform, prompts for the Gemini key and your dashboard API key, stores the key and the API key's SHA-256 digest in Key Vault, restarts the API revision so it loads them, and copies the Terraform outputs into the GitHub `production` environment. Secrets are passed to `az` through stdin with `no_log`, so they never land in Terraform state, shell history, the process list, or Ansible output. Re-running it is safe: Key Vault is only written when a value changed.
+
+Ansible needs a Linux or macOS control node. On Windows, use WSL. You also need Terraform, the Azure CLI, and the GitHub CLI, signed in with `az login` and `gh auth login`.
+
+```bash
+python3 -m pip install ansible-core
+cd ansible
+ansible-galaxy collection install -r requirements.yml
+ansible-playbook playbooks/bootstrap.yml
+```
+
+Then push to `main` (step 4) and verify the live deployment:
+
+```bash
+ansible-playbook playbooks/smoke-test.yml
+```
+
+The smoke test waits for the API to wake from scale-to-zero, checks `/health` and `/ready`, confirms a request without `X-API-Key` gets `401`, confirms the SSRF guard returns `400` for the cloud metadata address, then runs a real analysis and checks the report shape. Add `--skip-tags analysis` to skip the Gemini call. CI runs `ansible-lint` (production profile) and a syntax check on both playbooks.
+
+### Manual path
+
 1. Sign in and apply Terraform. Do not pass secrets as `-var` values.
 
    ```bash

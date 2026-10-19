@@ -25,6 +25,13 @@ jobs:
         with:
           terraform_wrapper: false
       - run: terraform fmt -check -recursive terraform
+      - name: Lint Ansible playbooks
+        working-directory: ansible
+        run: |
+          python -m pip install ansible-lint==26.10.1
+          ansible-galaxy collection install -r requirements.yml
+          ansible-lint
+          ansible-playbook --syntax-check playbooks/bootstrap.yml playbooks/smoke-test.yml
 
   sast-and-dependency-scan:
     needs: test
