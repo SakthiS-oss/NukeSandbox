@@ -79,7 +79,7 @@ The same steps in words, with where to find them in `main.py`:
 | Request context | Every request gets an `X-Request-ID` and an OpenTelemetry span. JSON logs include both. | `add_request_context_and_rate_limit` |
 | Authentication | The raw API key is hashed with SHA-256 and compared against `API_KEY_HASHES` in constant time. The server never stores raw keys. | `_authenticate_api_key` |
 | SSRF check | The hostname is resolved once. If any answer is loopback, private, link-local, or otherwise non-public, the request is rejected with `400`. | `_resolve_public_target` |
-| Sandbox hops | curl runs once per hop, pinned to the validated IP, never following redirects itself. The API validates each redirect target before the next hop. | `_inspect_target`, `_sandbox_command` |
+| Sandbox hops | curl runs once per hop, pinned to the validated IP, never following redirects itself. The API validates each redirect target before the next hop. The whole walk holds one in-process sandbox slot. | `_inspect_target`, `_sandbox_command` |
 | Report | Telemetry is redacted, sanitized, and fenced. Gemini must return JSON matching `SecurityReport`; anything else is rejected. | `_build_security_report_prompt`, `_request_security_report` |
 
 ## Tech stack
@@ -137,7 +137,7 @@ observability/              Argo CD canary, Kyverno policies, Prometheus alerts,
 | Leaked secrets | Gemini key committed or stored in Terraform state | Key Vault holds secrets; Terraform only creates placeholders; Ansible writes values over stdin. |
 | Over-privileged cloud identities | CI credentials that can do anything | Custom RBAC roles scoped to single resources; GitHub uses short-lived OIDC tokens, no stored passwords. |
 | Shipping vulnerable images | Base image with a critical CVE | Trivy fails the build on fixable HIGH/CRITICAL issues; only the scanned digest is deployed. |
-| Cost abuse | Someone loops requests | API key required, one API replica max, 15-second job timeout, no retries. |
+| Cost abuse | Someone loops requests | API key required, one API replica max, in-process per-key quota and sandbox cap, 15-second job timeout, no retries. |
 
 ### SSRF: re-validate and pin every hop
 
@@ -197,8 +197,8 @@ The API reads environment variables. Locally they come from `.env` (copy `.env.e
 | `AZURE_SANDBOX_JOB_NAME` | `nukesandbox-sandbox` | Container Apps Job to start. |
 | `AZURE_CONTAINER_APP_ENVIRONMENT_ID` | none | Used to look up the log stream endpoint for job logs. |
 | `AZURE_CLIENT_ID` | none | Selects the API's user-assigned managed identity. |
-| `RATE_LIMIT_ENABLED`, `REDIS_URL`, `RATE_LIMIT_REQUESTS`, `RATE_LIMIT_WINDOW_SECONDS` | off, -, `10`, `60` | Per-identity fixed-window quota in Redis (kubernetes branch). |
-| `CONCURRENCY_LIMIT_ENABLED`, `MAX_CONCURRENT_SANDBOXES`, `SANDBOX_SLOT_TTL_SECONDS` | off, `5`, `30` | Global cap on simultaneous sandboxes, in Redis (kubernetes branch). |
+| `RATE_LIMIT_ENABLED`, `REDIS_URL`, `RATE_LIMIT_REQUESTS`, `RATE_LIMIT_WINDOW_SECONDS` | off, -, `10`, `60` | Per-identity fixed-window quota. The window always applies in this process. `RATE_LIMIT_ENABLED` adds the same quota in Redis so it is shared across replicas (kubernetes branch). |
+| `CONCURRENCY_LIMIT_ENABLED`, `MAX_CONCURRENT_SANDBOXES`, `SANDBOX_SLOT_TTL_SECONDS` | off, `5`, `30` | Cap on simultaneous inspections. `MAX_CONCURRENT_SANDBOXES` always limits this process. `CONCURRENCY_LIMIT_ENABLED` adds a Redis cap shared across replicas (kubernetes branch). `SANDBOX_SLOT_TTL_SECONDS` is only the Redis slot TTL. |
 | `SANDBOX_EGRESS_PROXY`, `REQUIRE_EGRESS_PROXY` | none, `false` | Force sandbox traffic through an egress proxy (kubernetes branch). |
 | `SANDBOX_NAMESPACE` | `nukesandbox` | Namespace for sandbox Pods (Kubernetes mode). |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | none | OpenTelemetry Collector gRPC endpoint. Tracing is off when unset. |
@@ -238,7 +238,7 @@ pytest
 
 The suite runs without network access, Docker, or Azure; DNS and sandboxes are faked. It has two parts:
 
-- **`tests/test_security_controls.py`** checks behavior: private, metadata, and mixed DNS answers are blocked; curl is pinned with `--resolve`; redirects to private addresses or non-HTTP schemes are not followed; redirect loops stop at 5 hops; forged result lines are ignored; injected text stays inside the untrusted fence with a random boundary; the URL never reaches the prompt; API keys authenticate; rate and capacity limits reject excess requests; Docker, Azure, and Kubernetes sandboxes keep their hardening.
+- **`tests/test_security_controls.py`** checks behavior: private, metadata, and mixed DNS answers are blocked; curl is pinned with `--resolve`; redirects to private addresses or non-HTTP schemes are not followed; redirect loops stop at 5 hops; forged result lines are ignored; injected text stays inside the untrusted fence with a random boundary; the URL never reaches the prompt; API keys authenticate; in-process and Redis rate and capacity limits reject excess requests; Docker, Azure, and Kubernetes sandboxes keep their hardening.
 - **`tests/test_workload_security.py`** checks configuration: Terraform provisions ACR, Container Apps, and Key Vault without `Contributor`; workflows never publish `:latest` and deploy by digest; images are digest-pinned; Kyverno policies cover forbidden settings; Ansible tasks that touch secrets use `no_log` and never put secrets in command arguments.
 
 ## CI/CD pipeline
@@ -446,7 +446,7 @@ Response `200`: see the example in [What it does](#what-it-does). `telemetry_exc
 - **No network-level egress lock on Azure.** The SSRF defenses run in the application. A VNet with Azure Firewall would add a second layer, but costs far more than this project's budget.
 - **Container Apps Jobs expose fewer hardening settings** than Docker or Kubernetes (no read-only filesystem or capability controls).
 - **Job start accepts overrides.** The API sends only curl arguments, but any identity with `jobs/start` permission could ask the job to run a different image. Only the API identity has that permission.
-- **No rate limiting on Azure.** Cost control relies on API keys, the single API replica, and job timeouts. Redis-based quotas exist in the code but are only used on the `kubernetes` branch.
+- **Process-local quotas on Azure.** Each replica allows `RATE_LIMIT_REQUESTS` analyses per identity per window (default 10 per 60 seconds) and `MAX_CONCURRENT_SANDBOXES` inspections at once (default 5). That holds while `max_replicas` stays 1. Raising the replica count multiplies both caps. Redis quotas share one limit across replicas, and they are only turned on for the `kubernetes` branch.
 - **Header text still reaches the model** inside the untrusted fence. A persuasive header could still bias a single report; the fixed schema limits the damage to that report.
 
 More detail is in [`docs/threat-model.md`](docs/threat-model.md) and [`docs/azure.md`](docs/azure.md).

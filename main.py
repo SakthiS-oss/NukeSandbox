@@ -160,6 +160,10 @@ API_AUTH_REQUIRED = os.getenv("API_AUTH_REQUIRED", "false").lower() == "true"
 CONCURRENCY_LIMIT_ENABLED = os.getenv("CONCURRENCY_LIMIT_ENABLED", "false").lower() == "true"
 MAX_CONCURRENT_SANDBOXES = int(os.getenv("MAX_CONCURRENT_SANDBOXES", "5"))
 SANDBOX_SLOT_TTL_SECONDS = int(os.getenv("SANDBOX_SLOT_TTL_SECONDS", "30"))
+# One API replica can enforce these without Redis. The Redis flags above add a cap shared across replicas.
+_local_rate_lock = threading.Lock()
+_local_rate_windows: dict[str, tuple[int, int]] = {}
+_local_sandbox_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_SANDBOXES)
 SANDBOX_EGRESS_PROXY = os.getenv("SANDBOX_EGRESS_PROXY")
 REQUIRE_EGRESS_PROXY = os.getenv("REQUIRE_EGRESS_PROXY", "false").lower() == "true"
 AZURE_ARM_API_VERSION = "2024-03-01"
@@ -200,6 +204,23 @@ def _authenticate_api_key(provided_key: str | None) -> str:
     raise HTTPException(status_code=401, detail="A valid X-API-Key is required.")
 
 
+def _enforce_local_rate_limit(identity: str) -> None:
+    """Fixed-window quota stored in this process. A single replica does not need Redis."""
+    window = int(time.time() // RATE_LIMIT_WINDOW_SECONDS)
+    with _local_rate_lock:
+        current_window, count = _local_rate_windows.get(identity, (window, 0))
+        if current_window != window:
+            count = 0
+        count += 1
+        _local_rate_windows[identity] = (window, count)
+        if count == 1:
+            stale = [name for name, (seen, _seen_count) in _local_rate_windows.items() if seen != window]
+            for name in stale:
+                del _local_rate_windows[name]
+    if count > RATE_LIMIT_REQUESTS:
+        raise HTTPException(status_code=429, detail="Analysis quota exceeded; retry shortly.")
+
+
 def _enforce_rate_limit(identity: str) -> None:
     """Use Redis as a shared fixed-window quota; fail closed to protect sandbox spend."""
     key = f"nukesandbox:rate-limit:{identity}:{int(time.time() // RATE_LIMIT_WINDOW_SECONDS)}"
@@ -212,6 +233,21 @@ def _enforce_rate_limit(identity: str) -> None:
         raise HTTPException(status_code=503, detail="Rate limiter is unavailable.") from exc
     if requests > RATE_LIMIT_REQUESTS:
         raise HTTPException(status_code=429, detail="Analysis quota exceeded; retry shortly.")
+
+
+def _acquire_local_sandbox_slot() -> None:
+    """Take one in-process inspection slot, or reject. Blocking would pin a thread-pool worker."""
+    if _local_sandbox_semaphore.acquire(blocking=False):
+        return
+    SANDBOX_CAPACITY_REJECTIONS.inc()
+    raise HTTPException(status_code=429, detail="Sandbox capacity is currently exhausted; retry shortly.")
+
+
+def _release_local_sandbox_slot() -> None:
+    try:
+        _local_sandbox_semaphore.release()
+    except ValueError:
+        logger.error("local_sandbox_slot_release_failed")
 
 
 def _acquire_sandbox_slot() -> None:
@@ -261,8 +297,10 @@ async def add_request_context_and_rate_limit(request, call_next):
             if request.url.path == "/api/analyze":
                 identity = _authenticate_api_key(request.headers.get("X-API-Key"))
                 identity_token = identity_context.set(identity)
+                quota_identity = identity if API_AUTH_REQUIRED else (request.client.host if request.client else "unknown")
+                _enforce_local_rate_limit(quota_identity)
                 if RATE_LIMIT_ENABLED:
-                    _enforce_rate_limit(identity if API_AUTH_REQUIRED else (request.client.host if request.client else "unknown"))
+                    _enforce_rate_limit(quota_identity)
             response = await call_next(request)
             response.headers["X-Request-ID"] = request_id
             span.set_attribute("http.response.status_code", response.status_code)
@@ -415,32 +453,39 @@ def _parse_curl_result(telemetry: str, result_marker: str) -> dict[str, str]:
 
 
 def _inspect_target(target_url: str, first_address: str) -> str:
-    """Follow redirects one hop at a time, re-validating and pinning DNS before every request."""
-    current_url = target_url
-    pinned_address = first_address
-    sections: list[str] = []
-    for hop in range(1, MAX_REDIRECT_HOPS + 2):
-        result_marker = f"NUKESANDBOX_{secrets.token_hex(8)}"
-        raw = _run_selected_sandbox(current_url, pinned_address, result_marker)
-        result = _parse_curl_result(raw, result_marker)
-        sections.append(f"--- Hop {hop}: {current_url} ---\n{raw.replace(result_marker, 'curl-result').strip()}")
+    """Follow redirects one hop at a time, re-validating and pinning DNS before every request.
 
-        redirect_url = result.get("redirect_url", "")
-        if not result.get("http_code", "").startswith("3") or not redirect_url:
-            break
-        if hop > MAX_REDIRECT_HOPS:
-            sections.append(f"--- Stopped: more than {MAX_REDIRECT_HOPS} redirects. ---")
-            break
-        if urlparse(redirect_url).scheme not in {"http", "https"}:
-            sections.append("--- Redirect blocked: only http and https destinations are followed. ---")
-            break
-        try:
-            pinned_address = _resolve_public_target(redirect_url)
-        except HTTPException as exc:
-            sections.append(f"--- Redirect blocked before request: {exc.detail} ---")
-            break
-        current_url = redirect_url
-    return "\n".join(sections)[:MAX_TELEMETRY_CHARS]
+    The whole walk holds one in-process slot, so concurrent analyses cannot pile up sandbox jobs.
+    """
+    _acquire_local_sandbox_slot()
+    try:
+        current_url = target_url
+        pinned_address = first_address
+        sections: list[str] = []
+        for hop in range(1, MAX_REDIRECT_HOPS + 2):
+            result_marker = f"NUKESANDBOX_{secrets.token_hex(8)}"
+            raw = _run_selected_sandbox(current_url, pinned_address, result_marker)
+            result = _parse_curl_result(raw, result_marker)
+            sections.append(f"--- Hop {hop}: {current_url} ---\n{raw.replace(result_marker, 'curl-result').strip()}")
+
+            redirect_url = result.get("redirect_url", "")
+            if not result.get("http_code", "").startswith("3") or not redirect_url:
+                break
+            if hop > MAX_REDIRECT_HOPS:
+                sections.append(f"--- Stopped: more than {MAX_REDIRECT_HOPS} redirects. ---")
+                break
+            if urlparse(redirect_url).scheme not in {"http", "https"}:
+                sections.append("--- Redirect blocked: only http and https destinations are followed. ---")
+                break
+            try:
+                pinned_address = _resolve_public_target(redirect_url)
+            except HTTPException as exc:
+                sections.append(f"--- Redirect blocked before request: {exc.detail} ---")
+                break
+            current_url = redirect_url
+        return "\n".join(sections)[:MAX_TELEMETRY_CHARS]
+    finally:
+        _release_local_sandbox_slot()
 
 
 def _run_sandbox_telemetry(target_url: str, pinned_address: str | None, result_marker: str) -> str:

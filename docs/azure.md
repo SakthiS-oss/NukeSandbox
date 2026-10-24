@@ -64,6 +64,6 @@ Protect `main` so **Azure security-gated build and deploy** is required.
 
 - Container Apps Jobs do not expose the same seccomp/capability knobs as Kubernetes Pods.
 - Job start still accepts an ARM template override. This API sends args only; a caller with the raw `jobs/start` permission could still supply another image.
-- There is no Redis quota on this branch. API keys and the 15-second job timeout are the cost controls.
+- Each replica enforces an in-process per-key window (`RATE_LIMIT_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS`, default 10 per 60 seconds) and at most `MAX_CONCURRENT_SANDBOXES` inspections at once (default 5). That holds while `max_replicas` stays 1. A quota shared across more replicas still needs Redis.
 - Sandbox egress is not VNet-locked. The API validates and DNS-pins every hop, including redirects, so curl only connects to addresses that passed the public-IP check. Network-level lockdown still needs a VNet or Azure Firewall.
 - The curl image is pulled from Docker Hub by digest. Mirroring it into ACR is optional and adds a small storage charge.

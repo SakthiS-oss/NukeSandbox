@@ -4,6 +4,7 @@ import socket
 import hashlib
 import json
 import re
+import threading
 
 import pytest
 from fastapi import HTTPException
@@ -215,6 +216,68 @@ def test_docker_runner_keeps_malicious_url_as_one_argument(monkeypatch: pytest.M
     assert captured["image"] == main.SANDBOX_IMAGE
     assert captured["cap_drop"] == ["ALL"]
     assert captured["read_only"] is True
+
+
+def test_local_rate_limit_is_per_identity_and_resets_each_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": 1_700_000_000.0}
+    monkeypatch.setattr(main.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(main, "RATE_LIMIT_REQUESTS", 1)
+    monkeypatch.setattr(main, "RATE_LIMIT_WINDOW_SECONDS", 60)
+    monkeypatch.setattr(main, "_local_rate_windows", {})
+
+    main._enforce_local_rate_limit("portfolio-user")
+    with pytest.raises(HTTPException) as exc_info:
+        main._enforce_local_rate_limit("portfolio-user")
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail == "Analysis quota exceeded; retry shortly."
+
+    main._enforce_local_rate_limit("other-user")
+    clock["now"] += 60
+    main._enforce_local_rate_limit("portfolio-user")
+
+
+def test_local_sandbox_capacity_rejects_before_starting_a_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    semaphore = threading.BoundedSemaphore(1)
+    assert semaphore.acquire(blocking=False)
+    monkeypatch.setattr(main, "_local_sandbox_semaphore", semaphore)
+
+    def fail_if_called(*_args: object) -> str:
+        raise AssertionError("sandbox started")
+
+    monkeypatch.setattr(main, "_run_selected_sandbox", fail_if_called)
+    with pytest.raises(HTTPException) as exc_info:
+        main._inspect_target("https://public.example", "8.8.8.8")
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail == "Sandbox capacity is currently exhausted; retry shortly."
+
+
+def test_local_sandbox_slot_is_released_when_the_sandbox_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "_local_sandbox_semaphore", threading.BoundedSemaphore(1))
+
+    def fail(*_args: object) -> str:
+        raise main.SandboxRuntimeError("runtime down")
+
+    monkeypatch.setattr(main, "_run_selected_sandbox", fail)
+    with pytest.raises(main.SandboxRuntimeError):
+        main._inspect_target("https://public.example", "8.8.8.8")
+
+    monkeypatch.setattr(main, "_run_selected_sandbox", lambda *_args: _curl_output("ignored", "200"))
+    assert "Hop 1" in main._inspect_target("https://public.example", "8.8.8.8")
+
+
+def test_analyze_releases_the_redis_slot_when_local_capacity_is_full(monkeypatch: pytest.MonkeyPatch) -> None:
+    released: list[bool] = []
+    monkeypatch.setattr(main, "CONCURRENCY_LIMIT_ENABLED", True)
+    monkeypatch.setattr(main, "_acquire_sandbox_slot", lambda: None)
+    monkeypatch.setattr(main, "_release_sandbox_slot", lambda: released.append(True))
+    monkeypatch.setattr(main, "_resolve_public_target", lambda _url: "8.8.8.8")
+    monkeypatch.setattr(main, "_local_sandbox_semaphore", threading.BoundedSemaphore(0))
+    monkeypatch.setattr(main, "_run_selected_sandbox", lambda *_args: (_ for _ in ()).throw(AssertionError("sandbox started")))
+
+    with pytest.raises(HTTPException) as exc_info:
+        main.analyze(main.AnalyzeRequest(target_url="https://public.example"))
+    assert exc_info.value.status_code == 429
+    assert released == [True]
 
 
 def test_rate_limit_rejects_excess_requests(monkeypatch: pytest.MonkeyPatch) -> None:
