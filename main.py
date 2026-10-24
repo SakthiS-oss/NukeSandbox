@@ -16,7 +16,7 @@ import uuid
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 import docker
@@ -53,11 +53,23 @@ class AnalyzeRequest(BaseModel):
     target_url: HttpUrl = Field(..., description="URL to inspect")
 
 
+MAX_SUMMARY_CHARS = 800
+MAX_RECOMMENDATION_CHARS = 800
+MAX_FINDING_CHARS = 300
+MAX_FINDINGS = 8
+_NON_PUBLIC_TARGET_DETAIL = "Target URL must resolve only to public IP addresses."
+_PRIVATE_REDIRECT_LINE = f"--- Redirect blocked before request: {_NON_PUBLIC_TARGET_DETAIL} ---"
+_NON_HTTP_REDIRECT_LINE = "--- Redirect blocked: only http and https destinations are followed. ---"
+_RISK_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+_HOP_HEADER = re.compile(r"^--- Hop \d+: (\S+) ---$")
+_CURL_RESULT_LINE = re.compile(r"^curl-result (\w+)=(.*)$")
+
+
 class SecurityReport(BaseModel):
     risk_level: Literal["LOW", "MEDIUM", "HIGH"]
-    summary: str
-    technical_findings: list[str]
-    user_recommendation: str
+    summary: str = Field(..., max_length=MAX_SUMMARY_CHARS)
+    technical_findings: list[Annotated[str, Field(max_length=MAX_FINDING_CHARS)]] = Field(..., max_length=MAX_FINDINGS)
+    user_recommendation: str = Field(..., max_length=MAX_RECOMMENDATION_CHARS)
 
 
 class AnalyzeResponse(BaseModel):
@@ -400,7 +412,7 @@ def _resolve_public_target(target_url: str) -> str:
         raise HTTPException(status_code=400, detail="Target hostname cannot be resolved.")
     for address in addresses:
         if not ipaddress.ip_address(address).is_global:
-            raise HTTPException(status_code=400, detail="Target URL must resolve only to public IP addresses.")
+            raise HTTPException(status_code=400, detail=_NON_PUBLIC_TARGET_DETAIL)
     ipv4 = [address for address in addresses if ipaddress.ip_address(address).version == 4]
     return (ipv4 or addresses)[0]
 
@@ -475,7 +487,7 @@ def _inspect_target(target_url: str, first_address: str) -> str:
                 sections.append(f"--- Stopped: more than {MAX_REDIRECT_HOPS} redirects. ---")
                 break
             if urlparse(redirect_url).scheme not in {"http", "https"}:
-                sections.append("--- Redirect blocked: only http and https destinations are followed. ---")
+                sections.append(_NON_HTTP_REDIRECT_LINE)
                 break
             try:
                 pinned_address = _resolve_public_target(redirect_url)
@@ -850,6 +862,131 @@ def _run_azure_sandbox(target_url: str, pinned_address: str | None, result_marke
             _azure_stop_execution(execution_name)
 
 
+def _raise_risk(current: str, floor: str) -> str:
+    if _RISK_ORDER[floor] > _RISK_ORDER[current]:
+        return floor
+    return current
+
+
+def _redirect_host_is_non_public(redirect_url: str) -> bool:
+    """True when the redirect host is an IP literal outside the public internet."""
+    hostname = urlparse(redirect_url).hostname
+    if not hostname:
+        return False
+    try:
+        return not ipaddress.ip_address(hostname).is_global
+    except ValueError:
+        return False
+
+
+def _redirect_url_is_dangerous(redirect_url: str) -> bool:
+    """True for a non-HTTP scheme or an IP literal that is not a public address."""
+    if not redirect_url:
+        return False
+    if urlparse(redirect_url).scheme not in {"", "http", "https"}:
+        return True
+    return _redirect_host_is_non_public(redirect_url)
+
+
+def _remember_marked_field(fields: dict[str, str], name: str, value: str) -> None:
+    """Keep a marked curl field. A later forged line cannot erase a riskier value."""
+    if name not in _CURL_RESULT_FIELDS:
+        return
+    previous = fields.get(name)
+    if name == "ssl_verify_result" and previous not in {None, "", "0"}:
+        return
+    if name == "http_code" and previous is not None and previous.startswith("3"):
+        return
+    if name == "redirect_url" and previous is not None and _redirect_url_is_dangerous(previous):
+        return
+    fields[name] = value
+
+
+def _risk_floor_from_telemetry(telemetry: str) -> tuple[str, list[str]]:
+    """Derive a minimum risk level from marked curl fields and blocked-redirect lines.
+
+    Only lines that start with `curl-result` are trusted as curl's write-out. Header lines
+    are printed with a `< ` prefix, so they cannot clear a certificate failure or a bad redirect.
+    """
+    floor = "LOW"
+    saw_private = False
+    saw_bad_scheme = False
+    saw_cert_failure = False
+    hop_url = ""
+    fields: dict[str, str] = {}
+    private_line = False
+    non_http_line = False
+
+    def consider() -> None:
+        nonlocal floor, saw_private, saw_bad_scheme, saw_cert_failure
+        nonlocal hop_url, fields, private_line, non_http_line
+        if not hop_url and not fields and not private_line and not non_http_line:
+            return
+        ssl_result = fields.get("ssl_verify_result", "")
+        if ssl_result not in {"", "0"}:
+            saw_cert_failure = True
+            floor = _raise_risk(floor, "MEDIUM")
+        redirect_url = fields.get("redirect_url", "")
+        scheme = urlparse(redirect_url).scheme if redirect_url else ""
+        hop_scheme = urlparse(hop_url).scheme if hop_url else ""
+        is_redirect = fields.get("http_code", "").startswith("3") and bool(redirect_url)
+        if hop_scheme not in {"", "http", "https"}:
+            saw_bad_scheme = True
+            floor = _raise_risk(floor, "HIGH")
+        if scheme not in {"", "http", "https"} and (is_redirect or non_http_line):
+            saw_bad_scheme = True
+            floor = _raise_risk(floor, "HIGH")
+        # A private IP literal counts even as a protocol-relative URL. `/next` has no host, so it does not.
+        if private_line or (is_redirect and _redirect_host_is_non_public(redirect_url)):
+            saw_private = True
+            floor = _raise_risk(floor, "HIGH")
+        hop_url = ""
+        fields = {}
+        private_line = False
+        non_http_line = False
+
+    for line in telemetry.splitlines():
+        stripped = line.strip()
+        hop_match = _HOP_HEADER.match(stripped)
+        if hop_match:
+            consider()
+            hop_url = hop_match.group(1)
+            continue
+        result_match = _CURL_RESULT_LINE.match(stripped)
+        if result_match:
+            _remember_marked_field(fields, result_match.group(1), result_match.group(2).strip())
+            continue
+        if stripped == _PRIVATE_REDIRECT_LINE:
+            private_line = True
+            continue
+        if stripped == _NON_HTTP_REDIRECT_LINE:
+            non_http_line = True
+    consider()
+
+    findings: list[str] = []
+    if saw_private:
+        findings.append("A redirect to a private or metadata address was blocked before the request.")
+    if saw_bad_scheme:
+        findings.append("A redirect used a scheme other than http or https and was not followed.")
+    if saw_cert_failure:
+        findings.append("Certificate verification failed.")
+    return floor, findings
+
+
+def _apply_risk_floor(report: SecurityReport, telemetry: str) -> SecurityReport:
+    """Raise the model's risk level when the telemetry contradicts a LOW or MEDIUM verdict."""
+    floor, extra = _risk_floor_from_telemetry(telemetry)
+    level = _raise_risk(report.risk_level, floor)
+    findings = list(extra)
+    for item in report.technical_findings:
+        if item not in findings:
+            findings.append(item)
+    findings = findings[:MAX_FINDINGS]
+    if level == report.risk_level and findings == list(report.technical_findings):
+        return report
+    return report.model_copy(update={"risk_level": level, "technical_findings": findings})
+
+
 def _generate_security_report(target_url: str, telemetry: str) -> SecurityReport:
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
@@ -930,6 +1067,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             logger.warning("analysis_failed stage=report")
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+        report = _apply_risk_floor(report, telemetry)
         ANALYSIS_REQUESTS.labels(outcome="success").inc()
         logger.info("analysis_completed risk_level=%s", report.risk_level)
         return AnalyzeResponse(target_url=target_url, telemetry_excerpt=telemetry, report=report)

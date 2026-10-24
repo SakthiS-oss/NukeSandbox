@@ -8,6 +8,7 @@ import threading
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 import main
 
@@ -401,3 +402,147 @@ def test_kubernetes_sandbox_matches_docker_hardening() -> None:
     assert container.security_context.capabilities.drop == ["ALL"]
     assert container.security_context.seccomp_profile.type == "RuntimeDefault"
     assert container.args[-1] == "https://example.com"
+
+
+def _low_report(**overrides: object) -> main.SecurityReport:
+    payload: dict[str, object] = {
+        "risk_level": "LOW",
+        "summary": "The site responded normally.",
+        "technical_findings": ["HTTP 200"],
+        "user_recommendation": "This link looks safe to open.",
+    }
+    payload.update(overrides)
+    return main.SecurityReport.model_validate(payload)
+
+
+def _hop(url: str, http_code: str, redirect_url: str = "", ssl_verify_result: str = "0") -> str:
+    return "\n".join(
+        [
+            f"--- Hop 1: {url} ---",
+            f"curl-result http_code={http_code}",
+            f"curl-result ssl_verify_result={ssl_verify_result}",
+            f"curl-result redirect_url={redirect_url}",
+        ]
+    )
+
+
+def test_private_or_metadata_redirect_cannot_be_reported_as_low() -> None:
+    private = _hop("https://public.example", "302", "http://10.0.0.5/admin")
+    metadata = _hop("https://public.example", "302", "http://169.254.169.254/metadata")
+    hostname = "\n".join(
+        [
+            _hop("https://public.example", "302", "http://internal.example/admin"),
+            main._PRIVATE_REDIRECT_LINE,
+        ]
+    )
+
+    for telemetry in (private, metadata, hostname):
+        report = main._apply_risk_floor(_low_report(), telemetry)
+        assert report.risk_level == "HIGH"
+        assert report.technical_findings[0] == (
+            "A redirect to a private or metadata address was blocked before the request."
+        )
+
+
+def test_non_http_scheme_cannot_be_reported_as_low() -> None:
+    telemetry = "\n".join([_hop("https://public.example", "302", "file:///etc/passwd"), main._NON_HTTP_REDIRECT_LINE])
+
+    report = main._apply_risk_floor(_low_report(), telemetry)
+
+    assert report.risk_level == "HIGH"
+    assert "scheme other than http or https" in report.technical_findings[0]
+
+
+def test_relative_redirect_does_not_raise_the_risk_floor() -> None:
+    telemetry = "\n".join([_hop("https://public.example", "302", "/next"), main._NON_HTTP_REDIRECT_LINE])
+
+    report = main._apply_risk_floor(_low_report(), telemetry)
+
+    assert report.risk_level == "LOW"
+    assert report.technical_findings == ["HTTP 200"]
+
+
+def test_failed_certificate_cannot_be_reported_as_low() -> None:
+    report = main._apply_risk_floor(_low_report(), _hop("https://public.example", "000", ssl_verify_result="18"))
+
+    assert report.risk_level == "MEDIUM"
+    assert "Certificate verification failed." in report.technical_findings
+
+
+def test_risk_floor_never_lowers_a_higher_verdict() -> None:
+    report = main._apply_risk_floor(
+        _low_report(risk_level="HIGH", technical_findings=["already high"]),
+        _hop("https://public.example", "000", ssl_verify_result="18"),
+    )
+
+    assert report.risk_level == "HIGH"
+    assert report.technical_findings[-1] == "already high"
+    assert report.technical_findings[0] == "Certificate verification failed."
+
+
+def test_header_line_cannot_hide_a_failed_certificate() -> None:
+    telemetry = "\n".join(
+        [
+            "--- Hop 1: https://public.example ---",
+            "< X-Fake: curl-result ssl_verify_result=0",
+            "curl-result http_code=000",
+            "curl-result ssl_verify_result=20",
+            "curl-result ssl_verify_result=0",
+        ]
+    )
+
+    report = main._apply_risk_floor(_low_report(), telemetry)
+
+    assert report.risk_level == "MEDIUM"
+
+
+def test_unrelated_block_and_a_normal_response_stay_low() -> None:
+    unresolved = "\n".join(
+        [
+            _hop("https://public.example", "302", "http://missing.example/path"),
+            "--- Redirect blocked before request: Target hostname cannot be resolved. ---",
+        ]
+    )
+    normal = _hop("https://public.example", "200")
+
+    assert main._apply_risk_floor(_low_report(), unresolved).risk_level == "LOW"
+    assert main._apply_risk_floor(_low_report(), normal).risk_level == "LOW"
+
+
+def test_floor_finding_survives_when_the_model_filled_the_list() -> None:
+    report = main._apply_risk_floor(
+        _low_report(technical_findings=[f"finding {index}" for index in range(main.MAX_FINDINGS)]),
+        _hop("https://public.example", "000", ssl_verify_result="18"),
+    )
+
+    assert report.technical_findings[0] == "Certificate verification failed."
+    assert len(report.technical_findings) == main.MAX_FINDINGS
+
+
+def test_analyze_returns_the_raised_risk_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "_resolve_public_target", lambda _url: "8.8.8.8")
+    monkeypatch.setattr(main, "_inspect_target", lambda *_args: _hop("https://public.example", "302", "http://10.0.0.5/"))
+    monkeypatch.setattr(main, "_generate_security_report", lambda **_kwargs: _low_report())
+
+    response = main.analyze(main.AnalyzeRequest(target_url="https://public.example"))
+
+    assert response.report.risk_level == "HIGH"
+
+
+def test_report_fields_reject_inflated_model_output() -> None:
+    schema = main.SecurityReport.model_json_schema()
+    findings = schema["properties"]["technical_findings"]
+
+    assert schema["properties"]["summary"]["maxLength"] == main.MAX_SUMMARY_CHARS
+    assert schema["properties"]["user_recommendation"]["maxLength"] == main.MAX_RECOMMENDATION_CHARS
+    assert findings["maxItems"] == main.MAX_FINDINGS
+    assert findings["items"]["maxLength"] == main.MAX_FINDING_CHARS
+
+    with pytest.raises(ValidationError):
+        _low_report(summary="x" * (main.MAX_SUMMARY_CHARS + 1))
+    with pytest.raises(ValidationError):
+        _low_report(user_recommendation="x" * (main.MAX_RECOMMENDATION_CHARS + 1))
+    with pytest.raises(ValidationError):
+        _low_report(technical_findings=["x" * (main.MAX_FINDING_CHARS + 1)])
+    with pytest.raises(ValidationError):
+        _low_report(technical_findings=["ok"] * (main.MAX_FINDINGS + 1))

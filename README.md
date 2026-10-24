@@ -80,7 +80,7 @@ The same steps in words, with where to find them in `main.py`:
 | Authentication | The raw API key is hashed with SHA-256 and compared against `API_KEY_HASHES` in constant time. The server never stores raw keys. | `_authenticate_api_key` |
 | SSRF check | The hostname is resolved once. If any answer is loopback, private, link-local, or otherwise non-public, the request is rejected with `400`. | `_resolve_public_target` |
 | Sandbox hops | curl runs once per hop, pinned to the validated IP, never following redirects itself. The API validates each redirect target before the next hop. The whole walk holds one in-process sandbox slot. | `_inspect_target`, `_sandbox_command` |
-| Report | Telemetry is redacted, sanitized, and fenced. Gemini must return JSON matching `SecurityReport`; anything else is rejected. | `_build_security_report_prompt`, `_request_security_report` |
+| Report | Telemetry is redacted, sanitized, and fenced. Gemini must return JSON matching `SecurityReport`; anything else is rejected. Curl signals then raise the risk level, and report fields are length-capped. | `_build_security_report_prompt`, `_request_security_report`, `_apply_risk_floor` |
 
 ## Tech stack
 
@@ -157,7 +157,8 @@ The inspected server controls part of what the sandbox sees, so the telemetry is
 - The remaining telemetry is fenced between `<<<UNTRUSTED_TELEMETRY_<random>>>>` markers. The prompt tells the model that everything inside is evidence, never instructions, and that manipulation attempts should be reported as findings.
 - Control characters are stripped, lines are capped at 300 characters, and `<<<` / `>>>` sequences are neutralized so a header cannot fake the end of the fence.
 - The submitted URL and hostname are replaced with `<TARGET_URL>` and `<TARGET_HOST>` before anything reaches Gemini.
-- Gemini must answer with JSON matching the `SecurityReport` schema (temperature 0.2). Anything else is rejected with `502`.
+- Gemini must answer with JSON matching the `SecurityReport` schema (temperature 0.2). Summary, recommendation, and findings are length-capped. Anything else is rejected with `502`.
+- After the model responds, the API raises the verdict from curl's own fields. A failed certificate check cannot come back as `LOW`. A redirect to a private or metadata address, or a redirect whose scheme is not http or https, cannot come back below `HIGH`.
 
 ### Least-privilege identities on Azure
 
@@ -238,7 +239,7 @@ pytest
 
 The suite runs without network access, Docker, or Azure; DNS and sandboxes are faked. It has two parts:
 
-- **`tests/test_security_controls.py`** checks behavior: private, metadata, and mixed DNS answers are blocked; curl is pinned with `--resolve`; redirects to private addresses or non-HTTP schemes are not followed; redirect loops stop at 5 hops; forged result lines are ignored; injected text stays inside the untrusted fence with a random boundary; the URL never reaches the prompt; API keys authenticate; in-process and Redis rate and capacity limits reject excess requests; Docker, Azure, and Kubernetes sandboxes keep their hardening.
+- **`tests/test_security_controls.py`** checks behavior: private, metadata, and mixed DNS answers are blocked; curl is pinned with `--resolve`; redirects to private addresses or non-HTTP schemes are not followed; redirect loops stop at 5 hops; forged result lines are ignored; injected text stays inside the untrusted fence with a random boundary; the URL never reaches the prompt; a `LOW` verdict is raised when the telemetry shows a private or metadata redirect, a non-HTTP scheme, or a failed certificate check; oversized report fields are rejected; API keys authenticate; in-process and Redis rate and capacity limits reject excess requests; Docker, Azure, and Kubernetes sandboxes keep their hardening.
 - **`tests/test_workload_security.py`** checks configuration: Terraform provisions ACR, Container Apps, and Key Vault without `Contributor`; workflows never publish `:latest` and deploy by digest; images are digest-pinned; Kyverno policies cover forbidden settings; Ansible tasks that touch secrets use `no_log` and never put secrets in command arguments.
 
 ## CI/CD pipeline
@@ -447,7 +448,7 @@ Response `200`: see the example in [What it does](#what-it-does). `telemetry_exc
 - **Container Apps Jobs expose fewer hardening settings** than Docker or Kubernetes (no read-only filesystem or capability controls).
 - **Job start accepts overrides.** The API sends only curl arguments, but any identity with `jobs/start` permission could ask the job to run a different image. Only the API identity has that permission.
 - **Process-local quotas on Azure.** Each replica allows `RATE_LIMIT_REQUESTS` analyses per identity per window (default 10 per 60 seconds) and `MAX_CONCURRENT_SANDBOXES` inspections at once (default 5). That holds while `max_replicas` stays 1. Raising the replica count multiplies both caps. Redis quotas share one limit across replicas, and they are only turned on for the `kubernetes` branch.
-- **Header text still reaches the model** inside the untrusted fence. A persuasive header could still bias a single report; the fixed schema limits the damage to that report.
+- **Header text still reaches the model** inside the untrusted fence. A persuasive header can still bias the wording of a report. It cannot lower the verdict below the floor for a failed certificate check, a private or metadata redirect, or a non-HTTP redirect scheme, and the report fields are length-capped.
 
 More detail is in [`docs/threat-model.md`](docs/threat-model.md) and [`docs/azure.md`](docs/azure.md).
 
