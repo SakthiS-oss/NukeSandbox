@@ -192,8 +192,9 @@ The API reads environment variables. Locally they come from `.env` (copy `.env.e
 | `GOOGLE_API_KEY` | none (required) | Gemini API key. `/ready` fails without it. |
 | `NUKESANDBOX_MODEL` | `gemini-2.5-flash` | Gemini model name. |
 | `SANDBOX_EXECUTION_MODE` | `docker` | `docker`, `azure`, or `kubernetes`. |
-| `API_AUTH_REQUIRED` | `false` | Require `X-API-Key` on `/api/analyze`. Terraform sets `true` on Azure. |
+| `API_AUTH_REQUIRED` | `false` | Require `X-API-Key` on `/api/analyze` and `/metrics`. Terraform sets `true` on Azure. When this is true, `/docs`, `/redoc`, and `/openapi.json` are not registered. |
 | `API_KEY_HASHES` | none | JSON map of identity to SHA-256 key digest, e.g. `{"portfolio-user":"<digest>"}`. |
+| `API_DOCS_ENABLED` | on when auth is off | Set `true` or `false` to override the docs default above. |
 | `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP` | none | Where the sandbox job lives (Azure mode). |
 | `AZURE_SANDBOX_JOB_NAME` | `nukesandbox-sandbox` | Container Apps Job to start. |
 | `AZURE_CONTAINER_APP_ENVIRONMENT_ID` | none | Used to look up the log stream endpoint for job logs. |
@@ -239,7 +240,7 @@ pytest
 
 The suite runs without network access, Docker, or Azure; DNS and sandboxes are faked. It has two parts:
 
-- **`tests/test_security_controls.py`** checks behavior: private, metadata, and mixed DNS answers are blocked; curl is pinned with `--resolve`; redirects to private addresses or non-HTTP schemes are not followed; redirect loops stop at 5 hops; forged result lines are ignored; injected text stays inside the untrusted fence with a random boundary; the URL never reaches the prompt; a `LOW` verdict is raised when the telemetry shows a private or metadata redirect, a non-HTTP scheme, or a failed certificate check; oversized report fields are rejected; API keys authenticate; in-process and Redis rate and capacity limits reject excess requests; Docker, Azure, and Kubernetes sandboxes keep their hardening.
+- **`tests/test_security_controls.py`** checks behavior: private, metadata, and mixed DNS answers are blocked; curl is pinned with `--resolve`; redirects to private addresses or non-HTTP schemes are not followed; redirect loops stop at 5 hops; forged result lines are ignored; injected text stays inside the untrusted fence with a random boundary; the URL never reaches the prompt; a `LOW` verdict is raised when the telemetry shows a private or metadata redirect, a non-HTTP scheme, or a failed certificate check; oversized report fields are rejected; sandbox and model failures return a fixed message and keep the exception in the log; auth and quota errors still return `X-Request-ID`; metrics require the API key when auth is on; API docs stay off in that mode; API keys authenticate; in-process and Redis rate and capacity limits reject excess requests; Docker, Azure, and Kubernetes sandboxes keep their hardening.
 - **`tests/test_workload_security.py`** checks configuration: Terraform provisions ACR, Container Apps, and Key Vault without `Contributor`; workflows never publish `:latest` and deploy by digest; images are digest-pinned; Kyverno policies cover forbidden settings; Ansible tasks that touch secrets use `no_log` and never put secrets in command arguments.
 
 ## CI/CD pipeline
@@ -379,9 +380,9 @@ Things that would raise the bill: setting `min_replicas` above 0 to avoid cold s
 
 ## Observability
 
-- **Logs:** one JSON object per line with timestamp, level, message, `request_id`, and `trace_id`. On Azure they go to Log Analytics.
-- **Request IDs:** send `X-Request-ID` to correlate your own logs; otherwise the API generates one. It is returned on every response.
-- **Metrics:** `GET /metrics` exposes Prometheus text:
+- **Logs:** one JSON object per line with timestamp, level, message, `request_id`, and `trace_id`. Failures also include `error_type` and `error`. On Azure they go to Log Analytics.
+- **Request IDs:** send `X-Request-ID` to correlate your own logs; otherwise the API generates one. It is returned on every response, including auth and quota failures.
+- **Metrics:** `GET /metrics` exposes Prometheus text. When `API_AUTH_REQUIRED` is true, the request needs the same `X-API-Key` as `/api/analyze`. A metrics scrape does not spend the analysis quota:
 
   | Metric | Meaning |
   |---|---|
@@ -413,10 +414,10 @@ Response `200`: see the example in [What it does](#what-it-does). `telemetry_exc
 | Status | Meaning |
 |---|---|
 | `400` | Not an http/https URL, the hostname cannot be resolved or is not a valid DNS name, or it resolves to a non-public address. |
-| `401` | Missing or wrong `X-API-Key` (when authentication is required). |
+| `401` | Missing or wrong `X-API-Key` on `/api/analyze` or `/metrics` (when authentication is required). |
 | `422` | Request body is invalid, or the sandbox captured no telemetry. |
-| `429` | Rate limit or sandbox capacity exceeded (only when those Redis features are enabled). |
-| `502` | The sandbox failed or timed out, or Gemini failed or returned an invalid report. |
+| `429` | In-process rate limit or sandbox capacity exceeded. Redis quotas use the same status when those features are enabled. |
+| `502` | The sandbox failed or timed out, or Gemini failed or returned an invalid report. The response is a fixed message. The exception is in the server log. |
 | `503` | Authentication or the rate limiter is enabled but not configured. |
 
 ### Other endpoints
@@ -426,15 +427,15 @@ Response `200`: see the example in [What it does](#what-it-does). `telemetry_exc
 | `GET /` | The dashboard. |
 | `GET /health` | Liveness: returns `{"status": "ok"}` whenever the process is up. |
 | `GET /ready` | Readiness: `503` until `GOOGLE_API_KEY` is set and, in Azure mode, the subscription and resource group are configured. |
-| `GET /metrics` | Prometheus metrics. |
-| `GET /docs` | FastAPI's interactive OpenAPI documentation. |
+| `GET /metrics` | Prometheus metrics. Uses the same API key as `/api/analyze` when authentication is required. |
+| `GET /docs`, `GET /redoc`, `GET /openapi.json` | API documentation. Registered only when `API_DOCS_ENABLED` is true, or when that variable is unset and authentication is off. |
 
 ## Troubleshooting
 
 | Symptom | Likely cause and fix |
 |---|---|
 | Dashboard shows "frontend not built" | Run `npm ci && npm run build` in `frontend/`. |
-| `502 Docker runtime failure` locally | Docker Desktop is not running, or you started the API inside a container without Docker access. Run `python3 main.py` on the host. |
+| `502` with "The sandbox could not inspect that URL." | Docker Desktop is not running, or you started the API inside a container without Docker access. The Docker or Azure error is in the server log. Run `python3 main.py` on the host. |
 | First request on Azure takes 20+ seconds | Cold start: the API scaled to zero. Each redirect hop also starts a new sandbox job. |
 | `/ready` returns `503` on Azure | The Gemini key in Key Vault is still `REPLACE_ME`. Set it, then restart the revision (or re-run the Ansible bootstrap). |
 | `401` with the right key | `API_KEY_HASHES` must contain the SHA-256 of the exact key with no trailing newline: use `printf %s`, not `echo`. |

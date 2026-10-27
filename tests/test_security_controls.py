@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import socket
 import hashlib
 import json
@@ -7,7 +8,8 @@ import re
 import threading
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 import main
@@ -546,3 +548,125 @@ def test_report_fields_reject_inflated_model_output() -> None:
         _low_report(technical_findings=["x" * (main.MAX_FINDING_CHARS + 1)])
     with pytest.raises(ValidationError):
         _low_report(technical_findings=["ok"] * (main.MAX_FINDINGS + 1))
+
+
+class _LogCapture(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(main.JsonFormatter().format(record))
+
+
+def _api_key_hashes() -> str:
+    return json.dumps({"portfolio-user": hashlib.sha256(b"test-key").hexdigest()})
+
+
+def test_sandbox_and_report_failures_hide_the_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "_resolve_public_target", lambda _url: "8.8.8.8")
+    capture = _LogCapture()
+    main.logger.addHandler(capture)
+    try:
+        def fail_sandbox(*_args: object) -> str:
+            raise main.SandboxRuntimeError("Docker runtime failure: denied /var/run/docker.sock")
+
+        monkeypatch.setattr(main, "_inspect_target", fail_sandbox)
+        with pytest.raises(HTTPException) as sandbox_error:
+            main.analyze(main.AnalyzeRequest(target_url="https://public.example"))
+        assert sandbox_error.value.status_code == 502
+        assert sandbox_error.value.detail == main.SANDBOX_FAILURE_DETAIL
+        assert "docker.sock" not in str(sandbox_error.value.detail)
+
+        monkeypatch.setattr(main, "_inspect_target", lambda *_args: "telemetry")
+        monkeypatch.setattr(
+            main,
+            "_generate_security_report",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("GenAI API request failed: super-secret-genai-key")),
+        )
+        with pytest.raises(HTTPException) as report_error:
+            main.analyze(main.AnalyzeRequest(target_url="https://public.example"))
+        assert report_error.value.status_code == 502
+        assert report_error.value.detail == main.REPORT_FAILURE_DETAIL
+        assert "super-secret-genai-key" not in str(report_error.value.detail)
+    finally:
+        main.logger.removeHandler(capture)
+
+    logged = "\n".join(capture.lines)
+    assert "docker.sock" in logged
+    assert "super-secret-genai-key" in logged
+    assert "SandboxRuntimeError" in logged
+    assert "RuntimeError" in logged
+
+
+def test_auth_and_quota_failures_keep_the_request_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "API_AUTH_REQUIRED", True)
+    monkeypatch.setenv("API_KEY_HASHES", _api_key_hashes())
+    with TestClient(main.app) as client:
+        denied = client.post(
+            "/api/analyze",
+            headers={"X-Request-ID": "req-auth"},
+            json={"target_url": "https://public.example"},
+        )
+    assert denied.status_code == 401
+    assert denied.headers["X-Request-ID"] == "req-auth"
+
+    monkeypatch.setattr(main, "API_AUTH_REQUIRED", False)
+
+    def deny_quota(_identity: str) -> None:
+        raise HTTPException(status_code=429, detail="Analysis quota exceeded; retry shortly.")
+
+    monkeypatch.setattr(main, "_enforce_local_rate_limit", deny_quota)
+    with TestClient(main.app) as client:
+        limited = client.post(
+            "/api/analyze",
+            headers={"X-Request-ID": "req-quota"},
+            json={"target_url": "https://public.example"},
+        )
+    assert limited.status_code == 429
+    assert limited.headers["X-Request-ID"] == "req-quota"
+
+
+def test_metrics_require_the_api_key_and_skip_the_analysis_quota(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "API_AUTH_REQUIRED", True)
+    monkeypatch.setattr(main, "RATE_LIMIT_REQUESTS", 0)
+    monkeypatch.setenv("API_KEY_HASHES", _api_key_hashes())
+    with TestClient(main.app) as client:
+        denied = client.get("/metrics", headers={"X-Request-ID": "req-metrics"})
+        allowed = client.get("/metrics", headers={"X-API-Key": "test-key"})
+        health = client.get("/health")
+        ready = client.get("/ready")
+    assert denied.status_code == 401
+    assert denied.headers["X-Request-ID"] == "req-metrics"
+    assert allowed.status_code == 200
+    assert "nukesandbox_analysis_requests_total" in allowed.text
+    assert health.status_code == 200
+    assert ready.status_code != 401
+
+
+def test_running_app_matches_the_docs_policy() -> None:
+    routes = {getattr(route, "path", None) for route in main.app.routes}
+    if main._api_docs_enabled():
+        assert "/docs" in routes
+        assert "/openapi.json" in routes
+    else:
+        assert "/docs" not in routes
+        assert "/redoc" not in routes
+        assert "/openapi.json" not in routes
+
+
+def test_docs_follow_the_auth_default_and_can_be_overridden(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("API_DOCS_ENABLED", raising=False)
+    monkeypatch.setenv("API_AUTH_REQUIRED", "true")
+    assert main._api_docs_enabled() is False
+    hidden = FastAPI(**main._api_doc_urls())
+    with TestClient(hidden) as client:
+        assert client.get("/docs").status_code == 404
+        assert client.get("/redoc").status_code == 404
+        assert client.get("/openapi.json").status_code == 404
+
+    monkeypatch.setenv("API_DOCS_ENABLED", "true")
+    assert main._api_docs_enabled() is True
+    shown = FastAPI(**main._api_doc_urls())
+    with TestClient(shown) as client:
+        assert client.get("/openapi.json").status_code == 200

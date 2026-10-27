@@ -84,7 +84,28 @@ class SandboxRuntimeError(RuntimeError):
 
 load_dotenv()  # Local-development fallback; Kubernetes injects this through a Secret.
 
-app = FastAPI(title="NukeSandbox API", version="1.0.0")
+SANDBOX_FAILURE_DETAIL = "The sandbox could not inspect that URL."
+REPORT_FAILURE_DETAIL = "The risk report could not be generated."
+
+
+def _api_docs_enabled() -> bool:
+    """Keep Swagger and the OpenAPI schema off once the API requires a key.
+
+    Set API_DOCS_ENABLED=true or false to override that default.
+    """
+    configured = os.getenv("API_DOCS_ENABLED")
+    if configured is not None:
+        return configured.lower() == "true"
+    return os.getenv("API_AUTH_REQUIRED", "false").lower() != "true"
+
+
+def _api_doc_urls() -> dict[str, str | None]:
+    if _api_docs_enabled():
+        return {"docs_url": "/docs", "redoc_url": "/redoc", "openapi_url": "/openapi.json"}
+    return {"docs_url": None, "redoc_url": None, "openapi_url": None}
+
+
+app = FastAPI(title="NukeSandbox API", version="1.0.0", **_api_doc_urls())
 app.mount("/metrics", make_asgi_app())
 
 request_id_context: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
@@ -110,16 +131,22 @@ class JsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         span_context = trace.get_current_span().get_span_context()
-        return json.dumps(
-            {
-                "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%SZ"),
-                "level": record.levelname,
-                "logger": record.name,
-                "message": record.getMessage(),
-                "request_id": request_id_context.get(),
-                "trace_id": format(span_context.trace_id, "032x") if span_context.is_valid else None,
-            }
-        )
+        payload: dict[str, object] = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%SZ"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": request_id_context.get(),
+            "trace_id": format(span_context.trace_id, "032x") if span_context.is_valid else None,
+        }
+        if record.exc_info and record.exc_info[1] is not None:
+            error = record.exc_info[1]
+            error_text = str(error)
+            if len(error_text) > 2000:
+                error_text = error_text[:2000] + " [truncated]"
+            payload["error_type"] = type(error).__name__
+            payload["error"] = error_text
+        return json.dumps(payload)
 
 
 logger = logging.getLogger("nukesandbox")
@@ -293,6 +320,16 @@ def _release_sandbox_slot() -> None:
         logger.error("sandbox_slot_release_failed")
 
 
+def _is_metrics_path(path: str) -> bool:
+    return path == "/metrics" or path.startswith("/metrics/")
+
+
+def _error_response(exc: HTTPException, request_id: str) -> JSONResponse:
+    headers = dict(exc.headers or {})
+    headers["X-Request-ID"] = request_id
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=headers)
+
+
 @app.middleware("http")
 async def add_request_context_and_rate_limit(request, call_next):
     """Correlate API work end-to-end and enforce a shared analysis quota."""
@@ -306,19 +343,22 @@ async def add_request_context_and_rate_limit(request, call_next):
             span.set_attribute("http.request.method", request.method)
             span.set_attribute("url.path", request.url.path)
             span.set_attribute("nukesandbox.request_id", request_id)
-            if request.url.path == "/api/analyze":
-                identity = _authenticate_api_key(request.headers.get("X-API-Key"))
-                identity_token = identity_context.set(identity)
-                quota_identity = identity if API_AUTH_REQUIRED else (request.client.host if request.client else "unknown")
-                _enforce_local_rate_limit(quota_identity)
-                if RATE_LIMIT_ENABLED:
-                    _enforce_rate_limit(quota_identity)
-            response = await call_next(request)
-            response.headers["X-Request-ID"] = request_id
-            span.set_attribute("http.response.status_code", response.status_code)
-            return response
-    except HTTPException as exc:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+            try:
+                if request.url.path == "/api/analyze" or _is_metrics_path(request.url.path):
+                    identity = _authenticate_api_key(request.headers.get("X-API-Key"))
+                    identity_token = identity_context.set(identity)
+                    if request.url.path == "/api/analyze":
+                        quota_identity = identity if API_AUTH_REQUIRED else (request.client.host if request.client else "unknown")
+                        _enforce_local_rate_limit(quota_identity)
+                        if RATE_LIMIT_ENABLED:
+                            _enforce_rate_limit(quota_identity)
+                response = await call_next(request)
+                response.headers["X-Request-ID"] = request_id
+                span.set_attribute("http.response.status_code", response.status_code)
+                return response
+            except HTTPException as exc:
+                span.set_attribute("http.response.status_code", exc.status_code)
+                return _error_response(exc, request_id)
     finally:
         otel_context.detach(context_token)
         if identity_token is not None:
@@ -1052,8 +1092,8 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             telemetry = _inspect_target(target_url, first_address)
         except SandboxRuntimeError as exc:
             ANALYSIS_REQUESTS.labels(outcome="sandbox_error").inc()
-            logger.warning("analysis_failed stage=sandbox")
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            logger.warning("analysis_failed stage=sandbox", exc_info=exc)
+            raise HTTPException(status_code=502, detail=SANDBOX_FAILURE_DETAIL) from exc
 
         if not telemetry.strip():
             ANALYSIS_REQUESTS.labels(outcome="empty_telemetry").inc()
@@ -1064,8 +1104,8 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             report = _generate_security_report(target_url=target_url, telemetry=telemetry)
         except RuntimeError as exc:
             ANALYSIS_REQUESTS.labels(outcome="report_error").inc()
-            logger.warning("analysis_failed stage=report")
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            logger.warning("analysis_failed stage=report", exc_info=exc)
+            raise HTTPException(status_code=502, detail=REPORT_FAILURE_DETAIL) from exc
 
         report = _apply_risk_floor(report, telemetry)
         ANALYSIS_REQUESTS.labels(outcome="success").inc()
