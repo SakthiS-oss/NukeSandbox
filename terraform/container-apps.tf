@@ -114,6 +114,21 @@ resource "azurerm_container_app" "api" {
   }
 }
 
+locals {
+  curl_image_digest = split("@", var.sandbox_image)[1]
+  curl_image_tag    = regex("^curlimages/curl:([^@]+)@", var.sandbox_image)
+}
+
+# Import runs with the caller's Azure CLI login, the same identity that applies this stack.
+# The job then pulls login_server/curl@<digest> and never contacts Docker Hub.
+resource "terraform_data" "mirror_curl_image" {
+  triggers_replace = [var.sandbox_image]
+
+  provisioner "local-exec" {
+    command = "az acr import --name ${azurerm_container_registry.main.name} --source docker.io/curlimages/curl@${local.curl_image_digest} --image curl:${local.curl_image_tag} --force"
+  }
+}
+
 resource "azurerm_container_app_job" "sandbox" {
   name                         = "nukesandbox-sandbox"
   location                     = azurerm_resource_group.main.location
@@ -123,6 +138,16 @@ resource "azurerm_container_app_job" "sandbox" {
   replica_retry_limit          = 0
   tags                         = local.tags
 
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.sandbox.id]
+  }
+
+  registry {
+    server   = azurerm_container_registry.main.login_server
+    identity = azurerm_user_assigned_identity.sandbox.id
+  }
+
   manual_trigger_config {
     parallelism              = 1
     replica_completion_count = 1
@@ -131,11 +156,16 @@ resource "azurerm_container_app_job" "sandbox" {
   template {
     container {
       name    = "curl"
-      image   = var.sandbox_image
+      image   = "${azurerm_container_registry.main.login_server}/curl@${local.curl_image_digest}"
       cpu     = 0.25
       memory  = "0.5Gi"
       command = ["curl"]
       args    = ["--version"]
     }
   }
+
+  depends_on = [
+    azurerm_role_assignment.sandbox_acr_pull,
+    terraform_data.mirror_curl_image,
+  ]
 }

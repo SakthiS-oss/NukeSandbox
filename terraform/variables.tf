@@ -24,8 +24,8 @@ variable "api_image" {
 
 variable "sandbox_image" {
   type        = string
-  default     = "curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69"
-  description = "Digest-pinned curl image used by the disposable Container Apps Job."
+  default     = "curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93"
+  description = "Upstream curl image imported into this registry. The job pulls the ACR copy of this digest, not Docker Hub."
 }
 
 variable "min_replicas" {

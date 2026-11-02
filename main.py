@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Annotated, Literal
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import docker
 from dotenv import load_dotenv
@@ -187,9 +187,12 @@ MAX_TELEMETRY_CHARS = 12000
 MAX_TELEMETRY_LINE_CHARS = 300
 MAX_REDIRECT_HOPS = 5
 DOCKER_TIMEOUT_SECONDS = 10
+# HttpOptions.timeout is milliseconds. One hung Gemini call would otherwise hold the only replica.
+GEMINI_TIMEOUT_MS = 30_000
 # Manifest-list digest so Docker and Kubernetes pull the same immutable curl image.
+# Azure jobs pull the ACR mirror of this digest; Terraform imports it so the job never talks to Docker Hub.
 SANDBOX_IMAGE = (
-    "curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69"
+    "curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93"
 )
 KUBERNETES_NAMESPACE = os.getenv("SANDBOX_NAMESPACE", "nukesandbox")
 RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "false").lower() == "true"
@@ -421,6 +424,8 @@ def _build_security_report_prompt(target_url: str, telemetry: str) -> str:
 
 
 _DNS_HOSTNAME = re.compile(r"^[A-Za-z0-9.-]+$")
+_NUMERIC_HOST_PART = re.compile(r"^(?:0x[0-9a-f]+|\d+)$")
+_ALLOWED_TARGET_PORTS = frozenset({80, 443})
 
 
 def _is_ip_literal(hostname: str) -> bool:
@@ -431,18 +436,49 @@ def _is_ip_literal(hostname: str) -> bool:
         return False
 
 
+def _is_numeric_host_trick(hostname: str) -> bool:
+    """True when curl may treat the host as an IPv4 address but ipaddress does not.
+
+    Decimal (2130706433), hex (0x7f000001), octal (0177.0.0.1), and short dotted
+    forms match a DNS label pattern and are not ipaddress literals. curl parses
+    them with inet_aton rules; getaddrinfo may instead look them up as names.
+    Reject the form before either one runs.
+    """
+    host = hostname.rstrip(".").lower()
+    if not host or _is_ip_literal(host):
+        return False
+    if re.fullmatch(r"(?:0x[0-9a-f]+|\d+)", host):
+        return True
+    parts = host.split(".")
+    return 1 < len(parts) <= 4 and all(_NUMERIC_HOST_PART.fullmatch(part) for part in parts)
+
+
 def _resolve_public_target(target_url: str) -> str:
-    """Resolve the hostname once, reject non-public answers, and return the address to pin curl to."""
+    """Resolve the hostname once, reject non-public answers, and return the address to pin curl to.
+
+    Userinfo, ports other than 80 and 443, and non-canonical numeric hosts are rejected
+    before DNS. The sandbox must not be usable as a port scanner, and curl must not be
+    handed a host string it would interpret differently from getaddrinfo.
+    """
     parsed = urlparse(target_url)
+    if parsed.username is not None or parsed.password is not None:
+        raise HTTPException(status_code=400, detail="Target URL must not include userinfo.")
     hostname = parsed.hostname
     if not hostname:
         raise HTTPException(status_code=400, detail="Target URL must include a hostname.")
-    if not _DNS_HOSTNAME.match(hostname) and not _is_ip_literal(hostname):
-        raise HTTPException(status_code=400, detail="Target hostname is not a valid DNS name.")
     try:
-        parsed.port
+        port = parsed.port
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Target URL has an invalid port.") from exc
+    if port not in (None, *_ALLOWED_TARGET_PORTS):
+        raise HTTPException(status_code=400, detail="Target port must be 80 or 443.")
+    if _is_numeric_host_trick(hostname):
+        raise HTTPException(
+            status_code=400,
+            detail="Target hostname is not a canonical IP address or DNS name.",
+        )
+    if not _DNS_HOSTNAME.match(hostname) and not _is_ip_literal(hostname):
+        raise HTTPException(status_code=400, detail="Target hostname is not a valid DNS name.")
     try:
         results = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
@@ -526,15 +562,19 @@ def _inspect_target(target_url: str, first_address: str) -> str:
             if hop > MAX_REDIRECT_HOPS:
                 sections.append(f"--- Stopped: more than {MAX_REDIRECT_HOPS} redirects. ---")
                 break
-            if urlparse(redirect_url).scheme not in {"http", "https"}:
+            # curl reports the Location value. A relative Location such as /next has no
+            # scheme until it is resolved against this hop; treating that as non-HTTP
+            # records a normal site as blocked.
+            resolved_url = urljoin(current_url, redirect_url.strip())
+            if urlparse(resolved_url).scheme not in {"http", "https"}:
                 sections.append(_NON_HTTP_REDIRECT_LINE)
                 break
             try:
-                pinned_address = _resolve_public_target(redirect_url)
+                pinned_address = _resolve_public_target(resolved_url)
             except HTTPException as exc:
                 sections.append(f"--- Redirect blocked before request: {exc.detail} ---")
                 break
-            current_url = redirect_url
+            current_url = resolved_url
         return "\n".join(sections)[:MAX_TELEMETRY_CHARS]
     finally:
         _release_local_sandbox_slot()
@@ -919,11 +959,18 @@ def _redirect_host_is_non_public(redirect_url: str) -> bool:
         return False
 
 
+def _redirect_host_is_numeric_trick(redirect_url: str) -> bool:
+    hostname = urlparse(redirect_url).hostname
+    return bool(hostname) and _is_numeric_host_trick(hostname)
+
+
 def _redirect_url_is_dangerous(redirect_url: str) -> bool:
-    """True for a non-HTTP scheme or an IP literal that is not a public address."""
+    """True for a non-HTTP scheme, a non-canonical numeric host, or a non-public IP literal."""
     if not redirect_url:
         return False
     if urlparse(redirect_url).scheme not in {"", "http", "https"}:
+        return True
+    if _redirect_host_is_numeric_trick(redirect_url):
         return True
     return _redirect_host_is_non_public(redirect_url)
 
@@ -950,6 +997,7 @@ def _risk_floor_from_telemetry(telemetry: str) -> tuple[str, list[str]]:
     """
     floor = "LOW"
     saw_private = False
+    saw_numeric = False
     saw_bad_scheme = False
     saw_cert_failure = False
     hop_url = ""
@@ -958,7 +1006,7 @@ def _risk_floor_from_telemetry(telemetry: str) -> tuple[str, list[str]]:
     non_http_line = False
 
     def consider() -> None:
-        nonlocal floor, saw_private, saw_bad_scheme, saw_cert_failure
+        nonlocal floor, saw_private, saw_numeric, saw_bad_scheme, saw_cert_failure
         nonlocal hop_url, fields, private_line, non_http_line
         if not hop_url and not fields and not private_line and not non_http_line:
             return
@@ -979,6 +1027,9 @@ def _risk_floor_from_telemetry(telemetry: str) -> tuple[str, list[str]]:
         # A private IP literal counts even as a protocol-relative URL. `/next` has no host, so it does not.
         if private_line or (is_redirect and _redirect_host_is_non_public(redirect_url)):
             saw_private = True
+            floor = _raise_risk(floor, "HIGH")
+        if is_redirect and _redirect_host_is_numeric_trick(redirect_url):
+            saw_numeric = True
             floor = _raise_risk(floor, "HIGH")
         hop_url = ""
         fields = {}
@@ -1006,6 +1057,8 @@ def _risk_floor_from_telemetry(telemetry: str) -> tuple[str, list[str]]:
     findings: list[str] = []
     if saw_private:
         findings.append("A redirect to a private or metadata address was blocked before the request.")
+    if saw_numeric:
+        findings.append("A redirect used a non-canonical numeric hostname and was not followed.")
     if saw_bad_scheme:
         findings.append("A redirect used a scheme other than http or https and was not followed.")
     if saw_cert_failure:
@@ -1027,12 +1080,29 @@ def _apply_risk_floor(report: SecurityReport, telemetry: str) -> SecurityReport:
     return report.model_copy(update={"risk_level": level, "technical_findings": findings})
 
 
-def _generate_security_report(target_url: str, telemetry: str) -> SecurityReport:
+_genai_client: genai.Client | None = None
+_genai_client_key: str | None = None
+_genai_client_lock = threading.Lock()
+
+
+def _get_genai_client() -> genai.Client:
+    """Return the process-wide Gemini client, rebuilding it only when the API key changes."""
+    global _genai_client, _genai_client_key
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY is not set.")
+    with _genai_client_lock:
+        if _genai_client is None or _genai_client_key != api_key:
+            _genai_client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+            )
+            _genai_client_key = api_key
+        return _genai_client
 
-    client = genai.Client(api_key=api_key)
+
+def _generate_security_report(target_url: str, telemetry: str) -> SecurityReport:
+    client = _get_genai_client()
     chosen_model = os.getenv("NUKESANDBOX_MODEL", "gemini-2.5-flash")
     prompt = _build_security_report_prompt(target_url, telemetry)
 
@@ -1054,6 +1124,7 @@ def _request_security_report(client: genai.Client, chosen_model: str, prompt: st
             response_mime_type="application/json",
             response_schema=SecurityReport,
             temperature=0.2,
+            http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
         ),
     )
     if response.parsed is not None:

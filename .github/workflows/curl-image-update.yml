@@ -1,0 +1,48 @@
+name: Update pinned curl image
+
+on:
+  schedule:
+    # Monday 06:17 UTC. Curl releases are infrequent; a weekly check moves the digest when one ships.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-curl-pin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Move the curlimages/curl digest pin when upstream ships a fix
+        id: pin
+        env:
+          CURL_REPOSITORY: curlimages/curl
+        run: python3 .github/scripts/update_curl_pin.py
+
+      - name: Open a pull request for the new digest
+        if: steps.pin.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pin.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B chore/curl-image-pin
+          git add main.py terraform/variables.tf
+          git commit -m "Pin curlimages/curl ${TAG}."
+          if git ls-remote --exit-code --heads origin chore/curl-image-pin >/dev/null; then
+            git fetch origin "refs/heads/chore/curl-image-pin:refs/remotes/origin/chore/curl-image-pin"
+            git push --force-with-lease="chore/curl-image-pin:$(git rev-parse refs/remotes/origin/chore/curl-image-pin)" origin HEAD:chore/curl-image-pin
+          else
+            git push -u origin HEAD:chore/curl-image-pin
+          fi
+          title="Pin curlimages/curl ${TAG}"
+          existing="$(gh pr list --head chore/curl-image-pin --base main --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --title "$title" --body-file curl-pin-body.md
+          else
+            gh pr create --base main --head chore/curl-image-pin --title "$title" --body-file curl-pin-body.md
+          fi

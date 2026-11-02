@@ -54,6 +54,67 @@ def test_ssrf_guard_returns_the_validated_address_to_pin(monkeypatch: pytest.Mon
     assert main._resolve_public_target("https://public.example") == "8.8.8.8"
 
 
+def _dns_must_not_run(*_args: object, **_kwargs: object) -> list:
+    raise AssertionError("DNS was queried")
+
+
+@pytest.mark.parametrize(
+    "target_url",
+    [
+        "https://public.example",
+        "http://public.example",
+        "https://public.example:443/path",
+        "http://public.example:80/path",
+        "https://8.8.8.8/path",
+    ],
+)
+def test_web_ports_and_canonical_addresses_are_resolved(monkeypatch: pytest.MonkeyPatch, target_url: str) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: _addresses("8.8.8.8"))
+
+    assert main._resolve_public_target(target_url) == "8.8.8.8"
+
+
+@pytest.mark.parametrize(
+    "target_url",
+    ["https://public.example:8443", "http://public.example:22", "https://8.8.8.8:8080/path"],
+)
+def test_non_web_ports_are_rejected_before_dns(monkeypatch: pytest.MonkeyPatch, target_url: str) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", _dns_must_not_run)
+
+    with pytest.raises(HTTPException, match="80 or 443"):
+        main._resolve_public_target(target_url)
+
+
+@pytest.mark.parametrize(
+    "target_url",
+    ["https://user:pass@public.example", "https://user@8.8.8.8", "http://@public.example"],
+)
+def test_userinfo_is_rejected_before_dns(monkeypatch: pytest.MonkeyPatch, target_url: str) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", _dns_must_not_run)
+
+    with pytest.raises(HTTPException, match="userinfo"):
+        main._resolve_public_target(target_url)
+
+
+@pytest.mark.parametrize(
+    "target_url",
+    [
+        "http://2130706433",
+        "http://0x7f000001",
+        "http://0X7F000001",
+        "http://017700000001",
+        "http://0177.0.0.1",
+        "http://127.1",
+        "https://0x7f.0.0.1/latest",
+    ],
+)
+def test_numeric_host_tricks_are_rejected_before_dns(monkeypatch: pytest.MonkeyPatch, target_url: str) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", _dns_must_not_run)
+
+    with pytest.raises(HTTPException, match="canonical"):
+        main._resolve_public_target(target_url)
+
+
 def test_non_dns_hostnames_are_rejected_and_never_run_unpinned() -> None:
     with pytest.raises(HTTPException, match="valid DNS name"):
         main._resolve_public_target("https://example.com; touch /tmp/pwned")
@@ -109,6 +170,43 @@ def test_each_redirect_hop_is_revalidated_and_pinned(monkeypatch: pytest.MonkeyP
     assert calls == [("https://public.example", "8.8.8.8"), ("https://next.example/landing", "1.1.1.1")]
     assert "Hop 2: https://next.example/landing" in telemetry
     assert "curl-result http_code=200" in telemetry
+
+
+def test_relative_redirect_is_resolved_and_rechecked(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", _dns({"public.example": ["8.8.8.8"]}))
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_sandbox(url: str, pinned: str | None, marker: str) -> str:
+        calls.append((url, pinned))
+        if url == "https://public.example/start":
+            return _curl_output(marker, "302", "/next")
+        return _curl_output(marker, "200")
+
+    monkeypatch.setattr(main, "_run_selected_sandbox", fake_sandbox)
+    telemetry = main._inspect_target("https://public.example/start", "8.8.8.8")
+
+    assert calls == [
+        ("https://public.example/start", "8.8.8.8"),
+        ("https://public.example/next", "8.8.8.8"),
+    ]
+    assert "Hop 2: https://public.example/next" in telemetry
+    assert "Redirect blocked" not in telemetry
+
+
+def test_protocol_relative_redirect_is_resolved_then_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", _dns({"internal.example": ["10.0.0.5"]}))
+    calls: list[str] = []
+
+    def fake_sandbox(url: str, _pinned: str | None, marker: str) -> str:
+        calls.append(url)
+        return _curl_output(marker, "302", "//internal.example/admin")
+
+    monkeypatch.setattr(main, "_run_selected_sandbox", fake_sandbox)
+    telemetry = main._inspect_target("https://public.example/start", "8.8.8.8")
+
+    assert calls == ["https://public.example/start"]
+    assert "Redirect blocked before request" in telemetry
+    assert "public IP" in telemetry
 
 
 def test_redirect_to_non_http_scheme_is_not_followed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -455,6 +553,15 @@ def test_non_http_scheme_cannot_be_reported_as_low() -> None:
     assert "scheme other than http or https" in report.technical_findings[0]
 
 
+def test_numeric_redirect_cannot_be_reported_as_low() -> None:
+    telemetry = _hop("https://public.example", "302", "http://2130706433/")
+
+    report = main._apply_risk_floor(_low_report(), telemetry)
+
+    assert report.risk_level == "HIGH"
+    assert "non-canonical numeric hostname" in report.technical_findings[0]
+
+
 def test_relative_redirect_does_not_raise_the_risk_floor() -> None:
     telemetry = "\n".join([_hop("https://public.example", "302", "/next"), main._NON_HTTP_REDIRECT_LINE])
 
@@ -561,6 +668,55 @@ class _LogCapture(logging.Handler):
 
 def _api_key_hashes() -> str:
     return json.dumps({"portfolio-user": hashlib.sha256(b"test-key").hexdigest()})
+
+
+def test_gemini_client_is_reused_and_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    created: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-gemini-key")
+    monkeypatch.setattr(main.genai, "Client", FakeClient)
+    main._genai_client = None
+    main._genai_client_key = None
+    try:
+        first = main._get_genai_client()
+        second = main._get_genai_client()
+        monkeypatch.setenv("GOOGLE_API_KEY", "rotated-gemini-key")
+        third = main._get_genai_client()
+    finally:
+        main._genai_client = None
+        main._genai_client_key = None
+
+    assert first is second
+    assert third is not first
+    assert len(created) == 2
+    assert created[0]["http_options"].timeout == main.GEMINI_TIMEOUT_MS
+    assert created[1]["api_key"] == "rotated-gemini-key"
+
+
+def test_security_report_request_sets_a_timeout() -> None:
+    captured: dict[str, object] = {}
+
+    class FakeModels:
+        def generate_content(self, **kwargs: object) -> object:
+            captured.update(kwargs)
+
+            class Response:
+                parsed = _low_report()
+                text = None
+
+            return Response()
+
+    class FakeClient:
+        models = FakeModels()
+
+    report = main._request_security_report(FakeClient(), "gemini-2.5-flash", "prompt")
+
+    assert report.risk_level == "LOW"
+    assert captured["config"].http_options.timeout == main.GEMINI_TIMEOUT_MS
 
 
 def test_sandbox_and_report_failures_hide_the_exception(monkeypatch: pytest.MonkeyPatch) -> None:

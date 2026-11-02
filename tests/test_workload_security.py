@@ -59,6 +59,41 @@ def test_azure_terraform_provisions_acr_container_apps_and_key_vault() -> None:
     assert "Contributor" not in sources
 
 
+def test_sandbox_job_pulls_the_acr_mirror_of_the_pinned_curl_image() -> None:
+    import main
+
+    variables = (ROOT / "terraform" / "variables.tf").read_text()
+    stack = (ROOT / "terraform" / "container-apps.tf").read_text()
+    rbac = (ROOT / "terraform" / "rbac.tf").read_text()
+    digest = main.SANDBOX_IMAGE.split("@", 1)[1]
+    job = stack.split('resource "azurerm_container_app_job" "sandbox"', 1)[1]
+
+    assert digest in variables
+    assert "az acr import" in stack
+    assert "docker.io/curlimages/curl@" in stack
+    assert 'image   = "${azurerm_container_registry.main.login_server}/curl@${local.curl_image_digest}"' in job
+    assert "azurerm_user_assigned_identity.sandbox" in job
+    assert "curlimages/curl" not in job
+    assert "azurerm_user_assigned_identity.sandbox.principal_id" in rbac
+    assert "AcrPull" in rbac
+
+
+def test_curl_image_pin_is_updated_on_a_schedule() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "curl-image-update.yml").read_text()
+    script = (ROOT / ".github" / "scripts" / "update_curl_pin.py").read_text()
+
+    assert "schedule:" in workflow
+    assert "cron:" in workflow
+    assert "curlimages/curl" in workflow
+    assert "update_curl_pin.py" in workflow
+    assert "workflow_dispatch:" in workflow
+    assert ":latest" not in workflow
+    assert "main.py" in script
+    assert "terraform/variables.tf" in script
+    assert "application/vnd.docker.distribution.manifest.list.v2+json" in script
+    assert "application/vnd.oci.image.index.v1+json" in script
+
+
 def test_azure_ci_publishes_to_acr_not_latest() -> None:
     workflow = (ROOT / ".github" / "workflows" / "azure-security-gated-deploy.yml").read_text()
 
