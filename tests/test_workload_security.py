@@ -104,6 +104,12 @@ def test_azure_ci_publishes_to_acr_not_latest() -> None:
     assert ":latest" not in workflow
     assert "branches: [main]" in workflow
     assert "refs/heads/Azure" not in workflow
+    sign_at = workflow.index("cosign sign --yes")
+    verify_at = workflow.index("cosign verify")
+    deploy_at = workflow.index("az containerapp update")
+    assert sign_at < verify_at < deploy_at
+    assert "azure-security-gated-deploy.yml@refs/heads/main" in workflow
+    assert "https://token.actions.githubusercontent.com" in workflow
 
 
 def _playbook_tasks(name: str) -> list[dict]:

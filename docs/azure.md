@@ -3,7 +3,7 @@
 The API is a Consumption Container App. Each inspection is a manual Container Apps Job that runs digest-pinned `curl`, then exits. Images live in Azure Container Registry. Secrets live in Key Vault and are set with Azure CLI so they do not enter Terraform state.
 
 ```text
-GitHub Actions (OIDC) ── Semgrep + Trivy ──> ACR ──> Container App revision
+GitHub Actions (OIDC) ── Semgrep + Trivy ──> ACR ──> Cosign sign and verify ──> Container App revision
                                                       │
 Client ──> FastAPI ──> Container Apps Job (curl) ──> telemetry ──> Gemini
                  │
@@ -40,7 +40,7 @@ Terraform creates:
 - A job-scoped custom role for the API and an image-update role for GitHub
 - GitHub OIDC federated credentials for `main` and the `production` environment
 
-The first Container App revision uses the public quickstart image. CI replaces it with the scanned ACR digest. Until that happens, `/ready` will fail if the Gemini key is still `REPLACE_ME`.
+The first Container App revision uses the public quickstart image. CI replaces it with the scanned ACR digest. CI signs that digest with keyless Cosign and verifies the signature before it updates the Container App. Until that happens, `/ready` will fail if the Gemini key is still `REPLACE_ME`.
 
 ## GitHub settings
 

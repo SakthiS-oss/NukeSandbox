@@ -244,7 +244,7 @@ pytest
 The suite runs without network access, Docker, or Azure; DNS and sandboxes are faked. It has two parts:
 
 - **`tests/test_security_controls.py`** checks behavior: private, metadata, and mixed DNS answers are blocked; curl is pinned with `--resolve`; redirects to private addresses or non-HTTP schemes are not followed; redirect loops stop at 5 hops; forged result lines are ignored; injected text stays inside the untrusted fence with a random boundary; the URL never reaches the prompt; a `LOW` verdict is raised when the telemetry shows a private or metadata redirect, a non-HTTP scheme, or a failed certificate check; oversized report fields are rejected; SPDX triage lists OSV findings and writes a VEX statement only when a checked-in decision still matches; sandbox and model failures return a fixed message and keep the exception in the log; auth and quota errors still return `X-Request-ID`; metrics require the API key when auth is on; API docs stay off in that mode; API keys authenticate; in-process and Redis rate and capacity limits reject excess requests; Docker, Azure, and Kubernetes sandboxes keep their hardening.
-- **`tests/test_workload_security.py`** checks configuration: Terraform provisions ACR, Container Apps, and Key Vault without `Contributor`; workflows never publish `:latest` and deploy by digest; images are digest-pinned; Kyverno policies cover forbidden settings; Ansible tasks that touch secrets use `no_log` and never put secrets in command arguments.
+- **`tests/test_workload_security.py`** checks configuration: Terraform provisions ACR, Container Apps, and Key Vault without `Contributor`; workflows never publish `:latest`, sign the Azure image with Cosign, and deploy by digest only after that signature verifies; images are digest-pinned; Kyverno policies cover forbidden settings; Ansible tasks that touch secrets use `no_log` and never put secrets in command arguments.
 
 ## CI/CD pipeline
 
@@ -258,13 +258,14 @@ test ──> sast-and-dependency-scan ──> build-and-image-scan ──> deplo
 |---|---|---|
 | `test` | Runs pytest with coverage, `terraform fmt -check`, `ansible-lint` (production profile), and an Ansible syntax check. | Any test fails or files are badly formatted or linted. |
 | `sast-and-dependency-scan` | Semgrep scans the code for insecure patterns; Trivy scans dependencies and config files. | Semgrep finds an issue, or Trivy finds a fixable HIGH/CRITICAL vulnerability. |
-| `build-and-image-scan` | Builds the Docker image and scans it with Trivy. On pushes to `main` only: signs in to Azure with OIDC, pushes `nukesandbox:<commit-sha>` to ACR, and records the image digest. | The image has a fixable HIGH/CRITICAL vulnerability. |
-| `deploy` | Pushes to `main` only, in the `production` environment. Runs `az containerapp update` with `image@sha256:<digest>`. | Azure rejects the update. |
+| `build-and-image-scan` | Builds the Docker image and scans it with Trivy. On pushes to `main` only, in the `production` environment: signs in to Azure with OIDC, pushes `nukesandbox:<commit-sha>` to ACR, records the image digest, and signs that digest with keyless Cosign. | The image has a fixable HIGH/CRITICAL vulnerability, or Cosign cannot sign it. |
+| `deploy` | Pushes to `main` only, in the `production` environment. Verifies the Cosign signature for this workflow on `main`, then runs `az containerapp update` with `image@sha256:<digest>`. | The signature does not match, or Azure rejects the update. |
 
 Two details matter:
 
 - **Pull requests never touch Azure.** They run the tests and scans and build the image, then stop. Only a push to `main` publishes and deploys.
 - **Deploying by digest** means the image that runs is byte-for-byte the image that was scanned. A tag like `:latest` could be overwritten between scan and deploy; a digest cannot.
+- **Signing before deploy** means Cosign signs that digest with this workflow's GitHub OIDC identity, and the deploy job checks that signature before it updates Container Apps. An unsigned digest, or one signed by a different workflow, is not deployed.
 
 Terraform is applied by you (or the Ansible bootstrap), not by CI. Terraform also ignores changes to the API image, so a later `terraform apply` never rolls back what CI deployed.
 
@@ -372,7 +373,7 @@ The smoke test waits for the API to wake from scale-to-zero, checks `/health` an
 ### Recommended GitHub settings
 
 - Protect `main` and require the **Azure security-gated build and deploy** checks to pass before merging.
-- Add required reviewers to the `production` environment if you want a manual approval before each deploy.
+- Add required reviewers to the `production` environment if you want a manual approval before the image is published and signed, and again before it is deployed.
 
 ### Tearing it down
 
