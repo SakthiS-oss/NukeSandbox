@@ -1,0 +1,29 @@
+{
+  "results": [
+    {
+      "vulns": [
+        {
+          "id": "GHSA-fixture-0000-0000",
+          "severity": [
+            {
+              "type": "CVSS_V3",
+              "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+            }
+          ],
+          "affected": [
+            {
+              "ranges": [
+                {
+                  "events": [
+                    {"introduced": "0"},
+                    {"fixed": "1.2.0"}
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

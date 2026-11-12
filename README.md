@@ -16,6 +16,7 @@ The interesting part is not the report. It is everything around it: running untr
 - [Running locally](#running-locally)
 - [Tests](#tests)
 - [CI/CD pipeline](#cicd-pipeline)
+- [Supply chain](#supply-chain)
 - [Deploying to Azure](#deploying-to-azure)
 - [Cost](#cost)
 - [Observability](#observability)
@@ -101,10 +102,12 @@ The same steps in words, with where to find them in `main.py`:
 
 ```text
 main.py                     FastAPI app: auth, SSRF guard, sandbox runners, Gemini report, metrics
+supply_chain/triage.py      SPDX 2.3 SBOM triage against OSV, and one SPDX 3.0 VEX statement
 frontend/                   React + TypeScript dashboard (built into frontend/dist)
 Dockerfile                  Two-stage build: Node builds the dashboard, Python 3.12-slim runs the API as non-root
 tests/
   test_security_controls.py   Behavior tests: SSRF, pinning, redirects, prompt injection, auth, sandbox flags
+  test_supply_chain_triage.py SPDX triage and VEX, with OSV faked
   test_workload_security.py   Config tests: Terraform, workflows, manifests, and Ansible stay secure
 terraform/                  Azure stack for main (Container Apps, ACR, Key Vault, RBAC, GitHub OIDC)
   kubernetes/               Namespace, RBAC, and quotas for the kubernetes branch's cluster path
@@ -240,7 +243,7 @@ pytest
 
 The suite runs without network access, Docker, or Azure; DNS and sandboxes are faked. It has two parts:
 
-- **`tests/test_security_controls.py`** checks behavior: private, metadata, and mixed DNS answers are blocked; curl is pinned with `--resolve`; redirects to private addresses or non-HTTP schemes are not followed; redirect loops stop at 5 hops; forged result lines are ignored; injected text stays inside the untrusted fence with a random boundary; the URL never reaches the prompt; a `LOW` verdict is raised when the telemetry shows a private or metadata redirect, a non-HTTP scheme, or a failed certificate check; oversized report fields are rejected; sandbox and model failures return a fixed message and keep the exception in the log; auth and quota errors still return `X-Request-ID`; metrics require the API key when auth is on; API docs stay off in that mode; API keys authenticate; in-process and Redis rate and capacity limits reject excess requests; Docker, Azure, and Kubernetes sandboxes keep their hardening.
+- **`tests/test_security_controls.py`** checks behavior: private, metadata, and mixed DNS answers are blocked; curl is pinned with `--resolve`; redirects to private addresses or non-HTTP schemes are not followed; redirect loops stop at 5 hops; forged result lines are ignored; injected text stays inside the untrusted fence with a random boundary; the URL never reaches the prompt; a `LOW` verdict is raised when the telemetry shows a private or metadata redirect, a non-HTTP scheme, or a failed certificate check; oversized report fields are rejected; SPDX triage lists OSV findings and writes a VEX statement only when a checked-in decision still matches; sandbox and model failures return a fixed message and keep the exception in the log; auth and quota errors still return `X-Request-ID`; metrics require the API key when auth is on; API docs stay off in that mode; API keys authenticate; in-process and Redis rate and capacity limits reject excess requests; Docker, Azure, and Kubernetes sandboxes keep their hardening.
 - **`tests/test_workload_security.py`** checks configuration: Terraform provisions ACR, Container Apps, and Key Vault without `Contributor`; workflows never publish `:latest` and deploy by digest; images are digest-pinned; Kyverno policies cover forbidden settings; Ansible tasks that touch secrets use `no_log` and never put secrets in command arguments.
 
 ## CI/CD pipeline
@@ -264,6 +267,21 @@ Two details matter:
 - **Deploying by digest** means the image that runs is byte-for-byte the image that was scanned. A tag like `:latest` could be overwritten between scan and deploy; a digest cannot.
 
 Terraform is applied by you (or the Ansible bootstrap), not by CI. Terraform also ignores changes to the API image, so a later `terraform apply` never rolls back what CI deployed.
+
+## Supply chain
+
+The image SBOM is SPDX 2.3 JSON. On a non-PR push to `kubernetes`, `anchore/sbom-action` writes `nukesandbox-image.spdx.json`. `python -m supply_chain.triage` reads that file, keeps packages that have a purl, and asks the [OSV batch API](https://api.osv.dev/v1/querybatch) what is known about them. It writes `triage.json` with the package, version, SPDXID, purl, vulnerability id (a CVE alias when OSV has one, otherwise the OSV id), severity, and fixed version. The tool lists findings. It does not decide that a finding is harmless.
+
+A “not affected” statement is a checked-in decision in [`supply_chain/vex-decisions.json`](supply_chain/vex-decisions.json). That file holds at most one decision. When the vulnerability id and package SPDXID are both in the triage output, the tool writes `vex.spdx.json`, an SPDX 3.0 [`VexNotAffectedVulnAssessmentRelationship`](https://spdx.github.io/spdx-spec/v3.0.1/model/Security/Classes/VexNotAffectedVulnAssessmentRelationship/) with `relationshipType` `doesNotAffect`. The justification is one of the [VexJustificationType](https://spdx.github.io/spdx-spec/v3.0.1/model/Security/Vocabularies/VexJustificationType/) labels, plus a human `security_impactStatement`. If the decision names a vulnerability that is not in the triage output, the command exits non-zero and does not write the VEX document.
+
+The file starts empty, so the pipeline does not publish a VEX statement for a vulnerability that has not been checked against this image. [`tests/fixtures/vex-decision.json`](tests/fixtures/vex-decision.json) is the checked-in example. It uses `vulnerableCodeNotInExecutePath` for fixture package `fixture-lib`, because that package is not imported by the API and is not on the sandbox image's execution path. Copy a verified decision into `supply_chain/vex-decisions.json` only after the same id shows up in `triage.json`.
+
+```bash
+python -m supply_chain.triage nukesandbox-image.spdx.json \
+  --output triage.json \
+  --vex-output vex.spdx.json \
+  --decisions supply_chain/vex-decisions.json
+```
 
 ## Deploying to Azure
 
@@ -461,6 +479,6 @@ The [`kubernetes`](https://github.com/SakthiS-oss/NukeSandbox/tree/kubernetes) b
 - A Squid egress proxy and NetworkPolicies so sandbox traffic can only leave through the proxy.
 - Redis-backed per-key rate limits and a global sandbox concurrency cap.
 - External Secrets Operator for secrets, Kyverno admission policies, and Argo CD with a canary rollout.
-- A pipeline that pushes to GHCR, signs the image with Cosign, attaches an SBOM and build provenance, and verifies the signature before `kubectl apply`.
+- A pipeline that pushes to GHCR, signs the image with Cosign, attaches an SPDX SBOM and build provenance, triages that SBOM with OSV, writes an SPDX VEX statement when a checked-in decision still matches, and verifies the signature before `kubectl apply`.
 
 Check out that branch and follow its README to use it.

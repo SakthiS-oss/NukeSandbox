@@ -1,0 +1,26 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "nukesandbox-fixture",
+  "documentNamespace": "https://example.com/nukesandbox-fixture",
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-Package-fixture-lib",
+      "name": "fixture-lib",
+      "versionInfo": "1.0.0",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:pypi/fixture-lib@1.0.0"
+        }
+      ]
+    },
+    {
+      "SPDXID": "SPDXRef-Package-local-wheel",
+      "name": "local-wheel",
+      "versionInfo": "0.1.0"
+    }
+  ]
+}

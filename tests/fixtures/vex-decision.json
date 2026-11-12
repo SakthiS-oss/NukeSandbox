@@ -1,0 +1,10 @@
+{
+  "decisions": [
+    {
+      "vulnerabilityId": "GHSA-fixture-0000-0000",
+      "spdxId": "SPDXRef-Package-fixture-lib",
+      "security_justificationType": "vulnerableCodeNotInExecutePath",
+      "security_impactStatement": "fixture-lib is not imported by the API process and is not on the execution path of the sandbox image."
+    }
+  ]
+}
