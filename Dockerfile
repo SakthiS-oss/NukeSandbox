@@ -8,6 +8,10 @@ RUN npm run build
 FROM python:3.12-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
+# The slim image still ships zlib1g with fixable HIGH CVEs (CVE-2026-76844, CVE-2026-85091).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends --only-upgrade zlib1g \
+    && rm -rf /var/lib/apt/lists/*
 RUN addgroup --system app && adduser --system --ingroup app app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
