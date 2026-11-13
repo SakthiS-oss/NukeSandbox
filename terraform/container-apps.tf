@@ -116,7 +116,7 @@ resource "azurerm_container_app" "api" {
 
 locals {
   curl_image_digest = split("@", var.sandbox_image)[1]
-  curl_image_tag    = regex("^curlimages/curl:([^@]+)@", var.sandbox_image)
+  curl_image_tag    = regex("^curlimages/curl:([^@]+)@", var.sandbox_image)[0]
 }
 
 # Import runs with the caller's Azure CLI login, the same identity that applies this stack.
