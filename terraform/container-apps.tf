@@ -74,8 +74,18 @@ resource "azurerm_container_app" "api" {
       }
 
       env {
+        name  = "AZURE_SANDBOX_IMAGE"
+        value = "${azurerm_container_registry.main.login_server}/curl@${local.curl_image_digest}"
+      }
+
+      env {
         name  = "AZURE_CONTAINER_APP_ENVIRONMENT_ID"
         value = azurerm_container_app_environment.main.id
+      }
+
+      env {
+        name  = "AZURE_LOG_ANALYTICS_WORKSPACE_ID"
+        value = azurerm_log_analytics_workspace.main.workspace_id
       }
 
       env {
@@ -134,7 +144,7 @@ resource "azurerm_container_app_job" "sandbox" {
   location                     = azurerm_resource_group.main.location
   resource_group_name          = azurerm_resource_group.main.name
   container_app_environment_id = azurerm_container_app_environment.main.id
-  replica_timeout_in_seconds   = 15
+  replica_timeout_in_seconds   = 60
   replica_retry_limit          = 0
   tags                         = local.tags
 

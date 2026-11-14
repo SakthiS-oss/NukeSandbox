@@ -451,14 +451,17 @@ def test_gemini_prompt_never_includes_target_url_or_hostname() -> None:
     assert "<TARGET_HOST>" in prompt
 
 
-def test_azure_job_keeps_malicious_url_as_one_argument() -> None:
+def test_azure_job_keeps_malicious_url_as_one_argument(monkeypatch: pytest.MonkeyPatch) -> None:
     malicious_url = "https://example.com/;touch$IFS/tmp/pwned"
+    pinned_image = "nukesandbox.azurecr.io/curl@sha256:abc"
+    monkeypatch.setenv("AZURE_SANDBOX_IMAGE", pinned_image)
     body = main._azure_job_start_body(malicious_url, "93.184.216.34", "MARK")
     container = body["containers"][0]
 
     assert container["name"] == "curl"
-    assert "image" not in container
-    assert "command" not in container
+    assert container["image"] == pinned_image
+    assert malicious_url not in container["image"]
+    assert container["command"] == ["curl"]
     assert container["args"][-1] == malicious_url
     assert container["args"][:4] == ["-v", "-s", "--max-time", "8"]
     assert container["args"][container["args"].index("--resolve") + 1] == "example.com:443:93.184.216.34"

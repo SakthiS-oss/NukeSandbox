@@ -209,12 +209,11 @@ _local_sandbox_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_SANDBOXES)
 SANDBOX_EGRESS_PROXY = os.getenv("SANDBOX_EGRESS_PROXY")
 REQUIRE_EGRESS_PROXY = os.getenv("REQUIRE_EGRESS_PROXY", "false").lower() == "true"
 AZURE_ARM_API_VERSION = "2024-03-01"
-AZURE_JOB_WAIT_SECONDS = DOCKER_TIMEOUT_SECONDS + 25
+# Covers a cold image pull plus curl's own 8 second cap. The job deadline in Terraform is 60 seconds.
+AZURE_JOB_WAIT_SECONDS = 70
 _redis_client: Redis | None = None
 _azure_credential = None
 _azure_cached_token: tuple[str, float] | None = None
-_azure_event_stream_cache: str | None = None
-_azure_event_stream_loaded = False
 
 
 def _get_redis_client() -> Redis:
@@ -756,9 +755,29 @@ def _run_selected_sandbox(target_url: str, pinned_address: str | None, result_ma
 
 
 def _azure_job_start_body(target_url: str, pinned_address: str | None, result_marker: str) -> dict[str, object]:
-    """Override only curl args. The job template in Terraform owns the image."""
+    """Start the sandbox job with the pinned curl image and this hop's args.
+
+    Azure rejects a start whose container omits ``image`` (ContainerAppImageRequired).
+    The image comes from configuration, never from the submitted URL.
+    """
     command = _sandbox_command(target_url, pinned_address, result_marker)
-    return {"containers": [{"name": "curl", "args": command[1:]}]}
+    image = os.getenv("AZURE_SANDBOX_IMAGE", "").strip()
+    if not image:
+        raise SandboxRuntimeError("Azure sandbox mode requires AZURE_SANDBOX_IMAGE.")
+    return {
+        "containers": [
+            {
+                "name": "curl",
+                "image": image,
+                "command": ["curl"],
+                "args": command[1:],
+                "resources": {
+                    "cpu": float(os.getenv("AZURE_SANDBOX_CPU", "0.25")),
+                    "memory": os.getenv("AZURE_SANDBOX_MEMORY", "0.5Gi"),
+                },
+            }
+        ]
+    }
 
 
 def _get_azure_credential():
@@ -790,9 +809,14 @@ def _azure_settings() -> tuple[str, str, str]:
     return subscription, resource_group, job_name
 
 
-def _azure_arm_request(method: str, path: str, payload: dict[str, object] | None = None) -> tuple[int, dict[str, str], dict]:
+def _azure_arm_request(
+    method: str,
+    path: str,
+    payload: dict[str, object] | None = None,
+    api_version: str | None = None,
+) -> tuple[int, dict[str, str], dict]:
     separator = "&" if "?" in path else "?"
-    url = f"https://management.azure.com{path}{separator}api-version={AZURE_ARM_API_VERSION}"
+    url = f"https://management.azure.com{path}{separator}api-version={api_version or AZURE_ARM_API_VERSION}"
     body = None if payload is None else json.dumps(payload).encode()
     last_status = 0
     for attempt in range(4):
@@ -830,60 +854,48 @@ def _azure_execution_name(headers: dict[str, str], body: dict) -> str:
     raise SandboxRuntimeError("Azure job start did not return an execution name.")
 
 
-def _azure_event_stream_endpoint() -> str | None:
-    global _azure_event_stream_cache, _azure_event_stream_loaded
-    if _azure_event_stream_loaded:
-        return _azure_event_stream_cache
-    environment_id = os.getenv("AZURE_CONTAINER_APP_ENVIRONMENT_ID")
-    if not environment_id:
-        _azure_event_stream_loaded = True
-        return None
-    _status, _headers, body = _azure_arm_request("GET", environment_id)
-    endpoint = body.get("properties", {}).get("eventStreamEndpoint")
-    _azure_event_stream_cache = endpoint if isinstance(endpoint, str) and endpoint else None
-    _azure_event_stream_loaded = True
-    return _azure_event_stream_cache
-
-
-def _azure_first_replica(execution_name: str) -> str:
-    subscription, resource_group, job_name = _azure_settings()
-    path = (
-        f"/subscriptions/{subscription}/resourceGroups/{resource_group}"
-        f"/providers/Microsoft.App/jobs/{job_name}/executions/{execution_name}/replicas"
-    )
-    try:
-        _status, _headers, body = _azure_arm_request("GET", path)
-    except SandboxRuntimeError:
-        return execution_name
-    values = body.get("value")
-    if isinstance(values, list) and values and isinstance(values[0], dict):
-        name = values[0].get("name")
-        if isinstance(name, str) and name:
-            return name
-    return execution_name
-
-
 def _azure_fetch_logs(execution_name: str) -> str:
-    endpoint = _azure_event_stream_endpoint()
-    if not endpoint:
+    """Read curl output from Log Analytics. The job replica list is empty to this identity."""
+    workspace_id = os.getenv("AZURE_LOG_ANALYTICS_WORKSPACE_ID", "").strip()
+    if not workspace_id or not re.fullmatch(r"[A-Za-z0-9-]+", execution_name):
         return ""
-    subscription, resource_group, job_name = _azure_settings()
-    replica = _azure_first_replica(execution_name)
-    url = (
-        f"{endpoint.rstrip('/')}/subscriptions/{subscription}/resourceGroups/{resource_group}"
-        f"/providers/Microsoft.App/jobs/{job_name}/executions/{execution_name}"
-        f"/replicas/{replica}/containers/curl/logstream?follow=false&tailLines=400"
+    query = (
+        "ContainerAppConsoleLogs_CL"
+        f" | where ContainerGroupName_s startswith '{execution_name}-'"
+        " | where ContainerName_s == 'curl'"
+        " | order by TimeGenerated asc"
+        " | project Log_s"
     )
-    for attempt in range(3):
-        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {_azure_arm_token()}"})
+    url = f"https://api.loganalytics.io/v1/workspaces/{workspace_id}/query"
+    body = json.dumps({"query": query}).encode()
+    for attempt in range(12):
+        token = _get_azure_credential().get_token("https://api.loganalytics.io/.default").token
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
-                logs = response.read().decode("utf-8", errors="replace")[:MAX_TELEMETRY_CHARS]
-                if logs.strip():
-                    return logs
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            logger.warning("azure_log_query_failed attempt=%s status=%s", attempt + 1, exc.code)
+            exc.read()
+            time.sleep(2)
+            continue
         except urllib.error.URLError:
-            logger.warning("azure_log_stream_failed attempt=%s", attempt + 1)
-        time.sleep(0.5 * (attempt + 1))
+            logger.warning("azure_log_query_failed attempt=%s", attempt + 1)
+            time.sleep(2)
+            continue
+        tables = payload.get("tables") if isinstance(payload, dict) else None
+        rows = tables[0].get("rows") if isinstance(tables, list) and tables and isinstance(tables[0], dict) else None
+        if isinstance(rows, list) and rows:
+            lines = [row[0] for row in rows if isinstance(row, list) and row and isinstance(row[0], str)]
+            logs = "\n".join(lines).strip()
+            if logs:
+                return logs[:MAX_TELEMETRY_CHARS]
+        time.sleep(2)
     return ""
 
 

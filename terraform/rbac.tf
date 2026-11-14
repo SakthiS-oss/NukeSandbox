@@ -49,6 +49,7 @@ resource "azurerm_role_definition" "sandbox_runner" {
       "Microsoft.App/jobs/start/action",
       "Microsoft.App/jobs/stop/action",
       "Microsoft.App/jobs/executions/read",
+      "Microsoft.App/jobs/getAuthToken/action",
     ]
     not_actions = []
   }
@@ -65,5 +66,11 @@ resource "azurerm_role_assignment" "api_sandbox_runner" {
 resource "azurerm_role_assignment" "api_environment_reader" {
   scope                = azurerm_container_app_environment.main.id
   role_definition_name = "Reader"
+  principal_id         = azurerm_user_assigned_identity.api.principal_id
+}
+
+resource "azurerm_role_assignment" "api_log_reader" {
+  scope                = azurerm_log_analytics_workspace.main.id
+  role_definition_name = "Log Analytics Reader"
   principal_id         = azurerm_user_assigned_identity.api.principal_id
 }
